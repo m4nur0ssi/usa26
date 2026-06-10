@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WC 2026 — Experience Mondiale</title>
+    <link rel="stylesheet" href="style.css?v=152">
+    <link rel="stylesheet" href="splash.css?v=1">
+    <script>
+      // Erreurs loggées en console uniquement, pas de bannière intrusive.
+      window.onerror = function(msg, url, line, col, err) {
+        console.error('[wc2026]', msg, url, line, col, err);
+      };
+    </script>
+    <script src="splash.js?v=1" defer></script>
+</head>
+<body class="dark-theme">
+    <!-- ─── NAVIGATION ─── -->
+    <nav id="main-nav">
+        <div class="nav-inner">
+            <div class="nav-logo">
+                <div class="logo-badge">🌐</div>
+                <span class="logo-text">WC<span class="logo-accent">2026</span></span>
+            </div>
+            <div class="nav-links">
+                <button class="nav-btn nav-link active" data-view="groups">
+                    Groupes
+                </button>
+                <button class="nav-btn nav-link" data-view="calendar">
+                    Calendrier
+                </button>
+                <button class="nav-btn nav-link" data-view="stats">
+                    Stats
+                </button>
+                <button class="nav-btn nav-link" data-view="comparison">
+                    Comparer
+                </button>
+                <button class="nav-btn nav-link" data-view="custom-squad">
+                    Ma Sélection
+                </button>
+                <button class="nav-btn nav-link" data-view="knockout">
+                    Phases Finales
+                </button>
+                <button class="nav-btn nav-link" data-view="pronostics" style="background:rgba(124,58,237,0.15);border:1px solid rgba(124,58,237,0.4);color:#a78bfa">
+                    Pronostics
+                </button>
+                <button class="nav-btn nav-link" data-view="live" id="nav-live-btn" style="background:rgba(239,68,68,0.15);border:1px solid rgba(239,68,68,0.35);color:#ef4444;display:flex;align-items:center;gap:6px">
+                    <span class="live-dot-nav"></span> LIVE
+                </button>
+                <button class="nav-btn nav-link quizz-trigger" data-view="quizz" style="background: var(--grad-accent); color: white; border: none;">
+                    Quizz
+                </button>
+                <button class="nav-btn nav-link" data-view="classement" onclick="renderLeaderboard()" style="background:rgba(251,191,36,0.12);border:1px solid rgba(251,191,36,0.35);color:#fbbf24">
+                    Classement
+                </button>
+                <div id="pseudo-nav-indicator"></div>
+            </div>
+        </div>
+    </nav>
+
+    <!-- ─── MOBILE NAVIGATION (BOTTOM) ─── -->
+    <nav class="mobile-nav">
+        <a href="#" class="mobile-nav-item nav-link active" data-view="groups">
+            <span class="icon">▤</span>
+            <span>Groupes</span>
+        </a>
+        <a href="#" class="mobile-nav-item nav-link" data-view="calendar">
+            <span class="icon">📅</span>
+            <span>Matchs</span>
+        </a>
+        <a href="#" class="mobile-nav-item nav-link" data-view="stats">
+            <span class="icon">◈</span>
+            <span>Stats</span>
+        </a>
+        <a href="#" class="mobile-nav-item nav-link" data-view="knockout">
+            <span class="icon">🏆</span>
+            <span>Finales</span>
+        </a>
+        <a href="#" class="mobile-nav-item nav-link" data-view="quizz">
+            <span class="icon">❓</span>
+            <span>Quizz</span>
+        </a>
+        <a href="#" class="mobile-nav-item nav-link" data-view="classement" onclick="renderLeaderboard()">
+            <span class="icon">🏅</span>
+            <span>Classement</span>
+        </a>
+    </nav>
+
+    <main class="app-main" style="padding-top: 100px;">
+        <!-- ─── LIVE VIEW ─── -->
+        <div id="view-live" class="view">
+            <div id="live-content" style="max-width:900px;margin:0 auto;padding:24px 20px 60px"></div>
+        </div>
+
+        <!-- ─── GROUPS VIEW ─── -->
+        <div id="view-groups" class="view active">
+            <section class="page-header" style="text-align:center; padding: 40px 20px;">
+                <h1 style="font-size: 3rem; margin-bottom: 10px; font-family: var(--font-display);">Phase de Groupes</h1>
+                <p style="color: var(--text-3);">Analyse et classements des 12 groupes de la compétition</p>
+                <div class="filter-bar" style="display:flex; justify-content:center; margin-top: 30px;">
+                    <div id="group-tabs" class="nav-links" style="padding: 6px; gap: 8px;">
+                        <!-- Injected -->
+                    </div>
+                </div>
+            </section>
+            <div id="groups-grid" class="groups-grid" style="padding: 20px; max-width: 1400px; margin: 0 auto; display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 24px;">
+                <!-- Injected -->
+            </div>
+        </div>
+
+        <!-- ─── CALENDAR VIEW ─── -->
+        <div id="view-calendar" class="view">
+            <section class="page-header" style="text-align:center; padding: 40px 20px;">
+                <h1>Calendrier & Résultats</h1>
+                <p>Le chemin vers la finale</p>
+            </section>
+            <div id="calendar-matches" style="max-width: 1000px; margin: 0 auto; padding: 20px;">
+                <!-- Injected -->
+            </div>
+        </div>
+
+        <!-- ─── STATS VIEW ─── -->
+        <div id="view-stats" class="view">
+            <div class="stats-tabs-bar">
+                <button class="stats-tab active" onclick="statsSwitchTab('wc',this)">⚽ Stats CdM</button>
+                <button class="stats-tab" onclick="statsSwitchTab('players',this)">👤 Joueur</button>
+                <button class="stats-tab" onclick="statsSwitchTab('compare',this)">⚖️ Comparer</button>
+            </div>
+            <div id="stats-panel-wc" class="stats-panel active">
+                <div id="stats-content" style="max-width:1000px;margin:0 auto;padding:20px;"></div>
+            </div>
+            <div id="stats-panel-players" class="stats-panel">
+                <div class="sps-wrap">
+                    <div class="sps-search-area">
+                        <div class="sps-search-box">
+                            <span class="sps-search-icon">🔍</span>
+                            <input id="sps-input" class="sps-input" type="text" placeholder="Rechercher un joueur… (3 lettres min)" oninput="spsSearch(this.value)" autocomplete="off" spellcheck="false">
+                            <button class="sps-clear" onclick="spsClear()" id="sps-clear" style="display:none">✕</button>
+                        </div>
+                        <div id="sps-results" class="sps-results"></div>
+                    </div>
+                    <div id="sps-player-detail" class="sps-detail-area"></div>
+                </div>
+            </div>
+            <div id="stats-panel-compare" class="stats-panel">
+                <div class="spc-wrap">
+                    <div class="spc-col" id="spc-col-a">
+                        <div class="spc-search-box">
+                            <span class="sps-search-icon">🔍</span>
+                            <input id="spc-input-a" class="sps-input" type="text" placeholder="Joueur 1…" oninput="spcSearch('a',this.value)" autocomplete="off" spellcheck="false">
+                            <button class="sps-clear" onclick="spcClear('a')" id="spc-clear-a" style="display:none">✕</button>
+                        </div>
+                        <div id="spc-results-a" class="sps-results"></div>
+                        <div id="spc-card-a" class="spc-card-area"></div>
+                    </div>
+                    <div class="spc-versus" id="spc-versus">
+                        <div class="spc-vs-badge">VS</div>
+                        <div id="spc-bars" class="spc-bars-area"></div>
+                    </div>
+                    <div class="spc-col" id="spc-col-b">
+                        <div class="spc-search-box">
+                            <span class="sps-search-icon">🔍</span>
+                            <input id="spc-input-b" class="sps-input" type="text" placeholder="Joueur 2…" oninput="spcSearch('b',this.value)" autocomplete="off" spellcheck="false">
+                            <button class="sps-clear" onclick="spcClear('b')" id="spc-clear-b" style="display:none">✕</button>
+                        </div>
+                        <div id="spc-results-b" class="sps-results"></div>
+                        <div id="spc-card-b" class="spc-card-area"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ─── STADIUMS VIEW ─── -->
+        <div id="view-stadiums" class="view">
+            <section class="page-header" style="text-align:center; padding: 40px 20px;">
+                <h1>Villes & Stades</h1>
+            </section>
+            <div id="stadiums-content" style="display:grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 24px; padding: 20px; max-width: 1400px; margin: 0 auto;">
+                <!-- Injected -->
+            </div>
+        </div>
+
+        <!-- ─── COMPARISON VIEW ─── -->
+        <div id="view-comparison" class="view">
+            <section class="page-header" style="text-align:center; padding: 40px 20px;">
+                <h1>Comparateur</h1>
+            </section>
+            <div class="comparison-selectors" style="display:flex; justify-content:center; gap: 40px; margin-bottom: 40px;">
+                <select id="comp-team-1" class="nav-btn" style="background: var(--bg-3); border: 1px solid var(--border-2); padding: 12px 20px;"></select>
+                <div style="font-weight: 800; font-size: 1.5rem; align-self: center;">VS</div>
+                <select id="comp-team-2" class="nav-btn" style="background: var(--bg-3); border: 1px solid var(--border-2); padding: 12px 20px;"></select>
+            </div>
+            <div id="comparison-results" style="max-width: 800px; margin: 0 auto;"></div>
+        </div>
+
+        <!-- ─── CUSTOM SQUAD VIEW ─── -->
+        <div id="view-custom-squad" class="view cs-view">
+            <div id="custom-squad-container" class="cs-root">
+                <!-- Injected by JS -->
+            </div>
+        </div>
+
+        <!-- ─── KNOCKOUT VIEW ─── -->
+        <div id="view-knockout" class="view">
+            <section class="page-header" style="text-align:center; padding: 12px 20px 6px;">
+                <h1 style="font-size:1.6rem;margin:0">Tableau Final</h1>
+                <p style="margin:4px 0 0;font-size:0.8rem">La route vers le trophée mondial</p>
+            </section>
+            <div id="knockout-bracket" class="bracket-container" style="padding: 6px 20px 20px; overflow-x: auto;">
+                <!-- Injected -->
+            </div>
+        </div>
+
+        <!-- ─── PRONOSTICS VIEW ─── -->
+        <div id="view-pronostics" class="view">
+            <div id="pronostics-content" style="max-width:1200px;margin:0 auto;padding:24px 16px 80px"></div>
+        </div>
+
+        <!-- ─── CLASSEMENT VIEW ─── -->
+        <div id="view-classement" class="view">
+            <div id="leaderboard-content" style="max-width:720px;margin:0 auto;padding:20px 20px 80px">
+                <!-- Injected by renderLeaderboard() -->
+            </div>
+        </div>
+
+        <!-- ─── QUIZZ VIEW ─── -->
+        <div id="view-quizz" class="view">
+            <section class="page-header" style="text-align:center; padding: 40px 20px;">
+                <h1>Le Grand Quizz 2026</h1>
+                <p>Testez vos connaissances sur la Coupe du Monde</p>
+            </section>
+            
+            <div id="quizz-levels" style="max-width: 800px; margin: 0 auto; padding: 20px; display: flex; flex-direction: column; gap: 20px; align-items: center;">
+                <h2>Choisissez votre niveau</h2>
+                <div style="display: flex; gap: 20px; flex-wrap: wrap; justify-content: center;">
+                    <button class="nav-btn" onclick="startQuizz('easy')" style="background: var(--bg-3); border: 1px solid #4ade80; color: #4ade80; padding: 15px 40px; font-size: 1.2rem; border-radius: 12px; cursor: pointer;">Débutant</button>
+                    <button class="nav-btn" onclick="startQuizz('medium')" style="background: var(--bg-3); border: 1px solid #fbbf24; color: #fbbf24; padding: 15px 40px; font-size: 1.2rem; border-radius: 12px; cursor: pointer;">Intermédiaire</button>
+                    <button class="nav-btn" onclick="startQuizz('hard')" style="background: var(--bg-3); border: 1px solid #f87171; color: #f87171; padding: 15px 40px; font-size: 1.2rem; border-radius: 12px; cursor: pointer;">Expert</button>
+                </div>
+            </div>
+
+            <div id="quizz-game" style="display:none; max-width: 600px; margin: 0 auto; padding: 40px; background: var(--bg-2); border: 1px solid var(--border-2); border-radius: 16px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+                    <div id="quizz-question-num" style="font-weight: 700; color: var(--text-2);">Question 1/10</div>
+                    <div id="quizz-timer" style="font-family: var(--font-display); font-weight: 900; color: var(--accent-1); font-size: 1.5rem;">30s</div>
+                </div>
+                <div style="width: 100%; height: 6px; background: var(--bg-3); border-radius: 3px; margin-bottom: 30px; overflow: hidden;">
+                    <div id="quizz-progress-fill" style="height: 100%; background: var(--grad-accent); width: 0%; transition: width 0.3s ease;"></div>
+                </div>
+                <h3 id="quizz-question-text" style="font-size: 1.3rem; margin-bottom: 30px; text-align: center; line-height: 1.4;"></h3>
+                <div id="quizz-options" style="display: flex; flex-direction: column; gap: 15px;"></div>
+                <div style="margin-top: 30px; text-align: center;">
+                    <button onclick="quitQuizz()" style="background: transparent; border: none; color: var(--text-4); font-size: 0.9rem; text-decoration: underline; cursor: pointer;">Abandonner</button>
+                </div>
+            </div>
+
+            <div id="quizz-results" style="display:none; text-align:center; padding: 60px; max-width: 600px; margin: 0 auto; background: var(--bg-2); border: 1px solid var(--border-2); border-radius: 16px;">
+                <h2 style="font-size: 2rem; margin-bottom: 20px;">Résultats</h2>
+                <div id="quizz-score" style="font-family: var(--font-display); font-size: 4rem; font-weight: 900; color: var(--accent-1); margin-bottom: 10px;">0/10</div>
+                <p id="quizz-feedback" style="font-size: 1.2rem; color: var(--text-2); margin-bottom: 40px;"></p>
+                <div style="display: flex; gap: 20px; justify-content: center;">
+                    <button class="nav-btn" onclick="resetQuizz()" style="background: var(--bg-3); border: 1px solid var(--border-2); padding: 12px 30px; border-radius: 12px; cursor: pointer;">Rejouer</button>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <div id="side-panel" class="side-panel">
+        <div class="panel-backdrop" onclick="closePanel()"></div>
+        <div id="panel-drawer" class="panel-drawer">
+            <div class="panel-header">
+                <h2 id="panel-title"></h2>
+                <button class="close-btn" onclick="closePanel()">×</button>
+            </div>
+            <div id="panel-body" class="panel-body"></div>
+        </div>
+    </div>
+
+    <!-- ─── PSEUDO MODAL ─── -->
+    <div id="pseudo-modal" class="pseudo-modal-overlay">
+        <div class="pseudo-modal-card">
+            <div class="pseudo-modal-title" id="pseudo-modal-title">Choisir un pseudo</div>
+            <p class="pseudo-modal-sub">Pour sauvegarder tes pronostics et ta sélection</p>
+            <input type="text" id="pseudo-input" class="ios26-input" placeholder="Ton pseudo..." maxlength="20"
+                   onkeydown="if(event.key==='Enter') validatePseudo()">
+            <div class="avatar-customizer" id="avatar-customizer">
+                <div class="avc-preview-col">
+                    <div class="avc-preview" id="avc-preview">??</div>
+                    <div class="avc-preview-label">Aperçu</div>
+                </div>
+                <div class="avc-controls">
+                    <div class="avc-section-label">Couleur</div>
+                    <div class="avc-swatches" id="avc-swatches"></div>
+                    <label class="avc-photo-btn" for="avc-file-input">📷 Photo</label>
+                    <input type="file" id="avc-file-input" accept="image/*" style="display:none" onchange="handleAvatarPhoto(this)">
+                    <button class="avc-remove-photo" id="avc-remove-photo" onclick="removeAvatarPhoto()" style="display:none">✕ Retirer</button>
+                </div>
+            </div>
+            <div class="pseudo-modal-actions">
+                <button class="ios26-btn" id="pseudo-cancel-btn" onclick="closePseudoModal()" style="flex:1">Plus tard</button>
+                <button class="ios26-btn ios26-btn-primary" onclick="validatePseudo()" style="flex:1">Valider</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="data.js?v=12"></script>
+    <script src="extra_data.js?v=20"></script>
+    <script src="quizz_data.js?v=12"></script>
+    <script src="main.js?v=166"></script>
+    <script src="squad_patch.js?v=103"></script>
+    <script src="sofascore_stats_v2.js?v=1"></script>
+    <script src="pronostic.js?v=10"></script>
+    <script src="bracket.js?v=7"></script>
+</body>
+</html>

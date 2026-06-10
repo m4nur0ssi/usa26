@@ -1,0 +1,22 @@
+# Deploy repo = static app only. Ignore everything, then whitelist runtime assets.
+/*
+
+# Runtime files served to the browser
+!index.html
+!style.css
+!splash.css
+!splash.js
+!data.js
+!extra_data.js
+!quizz_data.js
+!main.js
+!squad_patch.js
+!sofascore_stats_v2.js
+!pronostic.js
+!bracket.js
+
+# Image assets
+!images/
+
+# Keep this file
+!.gitignore
