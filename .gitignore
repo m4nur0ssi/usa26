@@ -18,5 +18,8 @@
 # Image assets
 !images/
 
+# Pages custom domain
+!CNAME
+
 # Keep this file
 !.gitignore
