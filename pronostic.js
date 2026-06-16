@@ -8,16 +8,129 @@ const ADMIN_PSEUDO = '_admin_';
 const USERS_KEY    = 'wc2026_users';   // { pseudo: { pronostics, customSquad } }
 const REAL_KEY     = 'wc2026_real';    // { scoreKey: { score, homeScorers, awayScorers, penalty, redCards } }
 const SESSION_KEY  = 'wc2026_pseudo';  // current pseudo (string)
+const REMOVED_PSEUDOS = new Set(['raph', 'Raph', 'Manu', 'Frred']);
 
 // ── SESSION STATE ─────────────────────────────────────────────────────────
 let currentPseudo = null;
 let pronoIsAdmin  = false;
 
+function isRemovedPseudo(pseudo) {
+  return REMOVED_PSEUDOS.has(String(pseudo || '').trim());
+}
+window.isRemovedPseudo = isRemovedPseudo;
+
 // ── STORAGE HELPERS ───────────────────────────────────────────────────────
 function loadUsers() {
-  try { return JSON.parse(localStorage.getItem(USERS_KEY)) || {}; } catch { return {}; }
+  try {
+    const users = JSON.parse(localStorage.getItem(USERS_KEY)) || {};
+    let changed = false;
+    Object.keys(users).forEach(pseudo => {
+      if (isRemovedPseudo(pseudo)) {
+        delete users[pseudo];
+        changed = true;
+      }
+    });
+    if (changed) localStorage.setItem(USERS_KEY, JSON.stringify(users));
+    return users;
+  } catch { return {}; }
 }
-function saveUsers(u) { localStorage.setItem(USERS_KEY, JSON.stringify(u)); }
+function saveUsers(u, skipCloud) {
+  Object.keys(u || {}).forEach(pseudo => {
+    if (isRemovedPseudo(pseudo)) delete u[pseudo];
+  });
+  localStorage.setItem(USERS_KEY, JSON.stringify(u));
+  if (!skipCloud) cloudPushUser(currentPseudo);
+}
+
+// ── CLOUD SYNC (Supabase) ─────────────────────────────────────────────────
+// Pronostics/avatars/sélections partagés entre appareils via une table
+// publique `wc_users` (pseudo → data jsonb). Clé publishable, accès anon.
+const SB_URL = 'https://cickkkfjotljaxjrpwex.supabase.co/rest/v1/wc_users';
+const SB_KEY = 'sb_publishable_91Az_TMDv2IwztI2kT4CCw_FLQuDywh';
+const SB_HEADERS = {
+  'apikey': SB_KEY,
+  'Authorization': 'Bearer ' + SB_KEY,
+  'Content-Type': 'application/json',
+};
+
+// Fusion de deux maps de pronos : union, et pour chaque clé on garde le plus
+// RÉCENT (ts le plus grand). Empêche un appareil aux données partielles/anciennes
+// d'écraser des pronos plus récents (cause des points qui changeaient au login).
+function _mergePronoMap(a = {}, b = {}) {
+  const out = { ...a };
+  Object.keys(b).forEach(k => {
+    const cur = out[k], nxt = b[k];
+    if (!cur || (nxt && (nxt.ts || 0) >= (cur.ts || 0))) out[k] = nxt;
+  });
+  return out;
+}
+
+// Fusionne l'objet utilisateur complet (pronos par ts, autres champs : non-vide récent gagne)
+function _mergeUser(base = {}, other = {}) {
+  return {
+    ...base, ...other,
+    pronostics: _mergePronoMap(base.pronostics, other.pronostics),
+    pronos:     _mergePronoMap(base.pronos, other.pronos),
+  };
+}
+
+let _sbPushTimer = null;
+function cloudPushUser(pseudo) {
+  if (!pseudo || isRemovedPseudo(pseudo)) return;
+  clearTimeout(_sbPushTimer);
+  _sbPushTimer = setTimeout(async () => {
+    try {
+      const users = loadUsers();
+      if (!users[pseudo]) return;
+      // Lire d'abord le cloud et fusionner par ts → on ne perd jamais les pronos
+      // faits sur un autre appareil, même si le local est partiel.
+      let merged = users[pseudo];
+      try {
+        const res = await fetch(`${SB_URL}?pseudo=eq.${encodeURIComponent(pseudo)}&select=data`, {
+          headers: SB_HEADERS, signal: AbortSignal.timeout(8000),
+        });
+        if (res.ok) {
+          const rows = await res.json();
+          if (Array.isArray(rows) && rows[0]?.data) {
+            merged = _mergeUser(rows[0].data, users[pseudo]);
+            users[pseudo] = merged;
+            saveUsers(users, true); // garde le local cohérent, sans re-pousser
+          }
+        }
+      } catch {}
+      await fetch(SB_URL + '?on_conflict=pseudo', {
+        method: 'POST',
+        headers: { ...SB_HEADERS, 'Prefer': 'resolution=merge-duplicates' },
+        body: JSON.stringify([{ pseudo, data: merged, updated_at: new Date().toISOString() }]),
+        signal: AbortSignal.timeout(8000),
+      });
+    } catch (e) { console.warn('[SYNC] push failed:', e.message); }
+  }, 1200);
+}
+
+async function cloudPullAll() {
+  try {
+    const res = await fetch(SB_URL + '?select=pseudo,data', {
+      headers: SB_HEADERS,
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const rows = await res.json();
+    if (!Array.isArray(rows)) return false;
+    const users = loadUsers();
+    rows.forEach(r => {
+      if (!r.pseudo) return;
+      if (isRemovedPseudo(r.pseudo)) {
+        delete users[r.pseudo];
+        return;
+      }
+      // fusion par ts pour tout le monde (y compris soi) → jamais de perte
+      users[r.pseudo] = _mergeUser(users[r.pseudo] || {}, r.data || {});
+    });
+    saveUsers(users, true);
+    return true;
+  } catch (e) { console.warn('[SYNC] pull failed:', e.message); return false; }
+}
 function loadReal()  {
   try { return JSON.parse(localStorage.getItem(REAL_KEY)) || {}; } catch { return {}; }
 }
@@ -61,6 +174,12 @@ function validatePseudo(forceConfirm) {
   const val = inp.value.trim().slice(0, 20);
   if (!val) {
     inp.style.borderColor = '#ef4444';
+    setTimeout(() => inp.style.borderColor = '', 1000);
+    return;
+  }
+  if (isRemovedPseudo(val)) {
+    inp.style.borderColor = '#ef4444';
+    _notify('Ce pseudo a été supprimé.', 'error');
     setTimeout(() => inp.style.borderColor = '', 1000);
     return;
   }
@@ -111,6 +230,7 @@ function _clearPseudoConflict() {
 }
 
 function _setPseudo(name) {
+  if (isRemovedPseudo(name)) return;
   currentPseudo = name;
   pronoIsAdmin  = (name === ADMIN_PSEUDO);
   localStorage.setItem(SESSION_KEY, name);
@@ -132,6 +252,11 @@ function _setPseudo(name) {
   saveUsers(users);
   _updatePseudoIndicator();
   _refreshAfterAuth();
+
+  // Récupère les pronos de ce pseudo depuis le cloud (autre appareil)
+  cloudPullAll().then(ok => {
+    if (ok) { _updatePseudoIndicator(); _refreshAfterAuth(); }
+  });
 
   if (!pronoIsAdmin) _notify(`👋 Bienvenue ${name}!`);
   else _notify('🔧 Mode Admin activé', 'success');
@@ -163,21 +288,24 @@ function logoutPseudo() {
 }
 
 function _updatePseudoIndicator() {
-  const el = document.getElementById('pseudo-nav-indicator');
-  if (!el) return;
+  let html;
   if (!currentPseudo) {
-    el.innerHTML = `<button class="nav-btn pni-login-btn" onclick="openPseudoModal()">👤 Connexion</button>`;
+    html = `<button class="nav-btn pni-login-btn" onclick="openPseudoModal()">👤 Connexion</button>`;
   } else {
     const badge = pronoIsAdmin ? '<span class="pni-admin-badge">ADMIN</span>' : '';
     const avHtml = typeof getAvatarHtml === 'function'
       ? getAvatarHtml(currentPseudo, loadUsers(), 24)
       : '';
-    el.innerHTML = `<div class="pni-chip" onclick="openPseudoModal('Mon profil')" style="cursor:pointer" title="Modifier le profil">
+    html = `<div class="pni-chip" onclick="openPseudoModal('Mon profil')" style="cursor:pointer" title="Modifier le profil">
       ${avHtml}
       <span class="pni-name">${currentPseudo}</span>${badge}
       <button class="pni-logout" onclick="event.stopPropagation();logoutPseudo()" title="Déconnexion">↩</button>
     </div>`;
   }
+  ['pseudo-nav-indicator', 'pseudo-nav-indicator-mobile'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = html;
+  });
 }
 
 // ── SCORING ENGINE ─────────────────────────────────────────────────────────
@@ -220,11 +348,20 @@ function scorePoints(prono, real) {
   // 3pts: exact score (replaces winner bonus)
   if (prono.score === real.score) { pts.winner = 0; pts.score = 3; }
 
-  // Scorers
-  const realH = [...(real.homeScorers || [])];
-  const realA = [...(real.awayScorers || [])];
-  const proH  = prono.homeScorers || [];
-  const proA  = prono.awayScorers || [];
+  // Scorers — compare par nom de famille normalisé (ESPN: "9' Julián Quiñones",
+  // effectif app: "Julián QUIÑONES" → les deux donnent "quinones")
+  const _scNorm = s => (s || '')
+    .replace(/^\d+'(?:\+\d+')?\s*/, '')
+    .replace(/\s*\((pen|csc)\)$/, '')
+    .toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .trim().split(' ').pop();
+  const _realSrc = real.homeScorers
+    ? { h: real.homeScorers, a: real.awayScorers }
+    : { h: real.scorers?.home, a: real.scorers?.away };
+  const realH = (_realSrc.h || []).map(_scNorm);
+  const realA = (_realSrc.a || []).map(_scNorm);
+  const proH  = (prono.homeScorers || []).map(_scNorm);
+  const proA  = (prono.awayScorers || []).map(_scNorm);
 
   let fH = 0, fA = 0;
   proH.forEach(s => { const i = realH.indexOf(s); if (i !== -1) { fH++; realH.splice(i, 1); } });
@@ -232,7 +369,7 @@ function scorePoints(prono, real) {
 
   const found = fH + fA;
   const totalProno = proH.length + proA.length;
-  const totalReal  = (real.homeScorers || []).length + (real.awayScorers || []).length;
+  const totalReal  = (_realSrc.h || []).length + (_realSrc.a || []).length;
 
   if (found === totalReal && totalProno === totalReal && totalReal > 0) {
     pts.scorers = 5; // All correct: bonus
@@ -240,19 +377,53 @@ function scorePoints(prono, real) {
     pts.scorers = found; // 1pt each
   }
 
-  // +1pt penalty
-  if (prono.penalty !== undefined && real.penalty !== undefined && prono.penalty === real.penalty) pts.penalty = 1;
+  // +1pt penalty — UNIQUEMENT si l'utilisateur a prédit un penalty (true) et qu'il
+  // y en a eu un. Les défauts (false) ne rapportent rien, sinon points gratuits.
+  if (prono.penalty === true && real.penalty === true) pts.penalty = 1;
 
-  // +1pt red cards (exact count)
-  if (prono.redCards !== undefined && real.redCards !== undefined && Number(prono.redCards) === Number(real.redCards)) pts.redCards = 1;
+  // +1pt cartons rouges — uniquement si prédit >0 et compte exact (0 par défaut = rien)
+  if (Number(prono.redCards) > 0 && Number(prono.redCards) === Number(real.redCards)) pts.redCards = 1;
 
   pts.total = pts.winner + pts.score + pts.scorers + pts.penalty + pts.redCards;
   return pts;
 }
 
+// Résultats effectifs : saisie admin + scores ESPN des matchs terminés
+function _effectiveReal() {
+  const real = { ...loadReal() };
+  if (typeof state !== 'undefined' && state.scores) {
+    Object.entries(state.scores).forEach(([key, score]) => {
+      if (!score || real[key]) return;
+      // un match en cours ne compte pas : ni via le statut API ('in'),
+      // ni via l'horaire (cas liveInfo vide juste après un reload)
+      const li = state.liveInfo ? state.liveInfo[key] : null;
+      if (li && li.state === 'in') return;
+      if (!li || !li.state) {
+        const kp = key.split('_');
+        const g = (typeof GROUPS !== 'undefined') ? GROUPS.find(x => x.id === kp[0]) : null;
+        const m = g?.matches[parseInt(kp[1])];
+        if (m && typeof matchLiveStatus === 'function' && matchLiveStatus(m) !== 'finished') return;
+      }
+      const sc = (state.scorers || {})[key] || {};
+      const det = (state.matchDetails || {})[key] || {};
+      const reds = (det.reds?.home?.length || 0) + (det.reds?.away?.length || 0);
+      const allSc = [...(sc.home || []), ...(sc.away || [])];
+      real[key] = {
+        score,
+        homeScorers: sc.home || [],
+        awayScorers: sc.away || [],
+        redCards: det.reds ? reds : undefined,
+        // penalty réel déduit des buteurs ESPN "(pen)"
+        penalty: allSc.length || det.reds ? allSc.some(n => /\(pen\)/.test(n)) : undefined,
+      };
+    });
+  }
+  return real;
+}
+
 function getUserStats(pseudo) {
   const users     = loadUsers();
-  const real      = loadReal();
+  const real      = _effectiveReal();
   const pronostics = (users[pseudo] && users[pseudo].pronostics) || {};
   let total = 0, matchCount = 0, exactScores = 0, allScorers = 0;
   for (const [key, realMatch] of Object.entries(real)) {
@@ -271,9 +442,106 @@ function getUserStats(pseudo) {
 function getLeaderboard() {
   const users = loadUsers();
   return Object.keys(users)
-    .filter(p => p !== ADMIN_PSEUDO)
+    .filter(p => p !== ADMIN_PSEUDO && !isRemovedPseudo(p))
     .map(pseudo => ({ pseudo, ...getUserStats(pseudo) }))
     .sort((a, b) => b.total - a.total || b.exactScores - a.exactScores || b.matchCount - a.matchCount);
+}
+
+// ── DÉTAIL DES POINTS D'UN PRONO (popup explicative) ───────────────────────
+function openPronoDetail(pseudo, scoreKey) {
+  const users = loadUsers();
+  const prono = users[pseudo]?.pronostics?.[scoreKey] || users[pseudo]?.pronos?.[scoreKey];
+  const [gid, idxS] = scoreKey.split('_');
+  const g = (typeof GROUPS !== 'undefined') ? GROUPS.find(x => x.id === gid) : null;
+  const m = g?.matches[parseInt(idxS)];
+  if (!prono || !m) return;
+  const real = _effectiveReal()[scoreKey] || null;
+  const hInfo = g.teams.find(t => t.name === m.h);
+  const aInfo = g.teams.find(t => t.name === m.a);
+  const pronoLbl = _pronoLabel(prono, m);
+
+  let bodyRows = '';
+  let totalHtml = '';
+  if (!real) {
+    bodyRows = `<div class="pdt-row"><span class="pdt-ico">⏳</span><div class="pdt-txt"><b>Match pas encore joué</b><span>Les points seront calculés au coup de sifflet final</span></div><span class="pdt-pts pdt-pending">—</span></div>`;
+  } else {
+    const pts = scorePoints(prono, real);
+    const row = (ok, ico, title, why, p) => `
+      <div class="pdt-row ${ok ? 'pdt-ok' : 'pdt-ko'}">
+        <span class="pdt-ico">${ico}</span>
+        <div class="pdt-txt"><b>${title}</b><span>${why}</span></div>
+        <span class="pdt-pts ${ok ? 'pdt-pts-ok' : ''}">${p}</span>
+      </div>`;
+
+    // Score exact / vainqueur
+    if (pts.score > 0) {
+      bodyRows += row(true, '🎯', 'Score exact', `Prono ${prono.score} = résultat ${real.score}`, '+3');
+    } else {
+      bodyRows += row(false, '🎯', 'Score exact', `Prono ${pronoLbl} ≠ résultat ${real.score}`, '0');
+      const w = _getWinner(real.score);
+      const wName = w === 'H' ? m.h : w === 'A' ? m.a : 'Match nul';
+      bodyRows += pts.winner > 0
+        ? row(true, '✅', 'Bon vainqueur', `Tu avais prévu la victoire ${w === 'D' ? '(nul)' : 'de ' + wName}`, '+1')
+        : row(false, '❌', 'Vainqueur', `${w === 'D' ? 'Match nul' : 'Victoire de ' + wName} — pas ton choix`, '0');
+    }
+
+    // Buteurs
+    const proSc = [...(prono.homeScorers || []), ...(prono.awayScorers || [])];
+    if (proSc.length) {
+      const realSc = [...(real.homeScorers || []), ...(real.awayScorers || [])]
+        .map(n => n.replace(/^\d+'(?:\+\d+')?\s*/, ''));
+      const why = pts.scorers >= 5
+        ? `Tous les buteurs trouvés ! (${realSc.join(', ') || '—'})`
+        : `${pts.scorers} bon${pts.scorers > 1 ? 's' : ''} buteur${pts.scorers > 1 ? 's' : ''} sur ${proSc.length} pronostiqué${proSc.length > 1 ? 's' : ''} · réels : ${realSc.join(', ') || 'aucun'}`;
+      bodyRows += row(pts.scorers > 0, '⚽', 'Buteurs', why, pts.scorers > 0 ? '+' + pts.scorers : '0');
+    }
+
+    // Penalty / rouges seulement si pronostiqués
+    // n'afficher penalty/rouges que si l'utilisateur les a réellement prédits
+    if (prono.penalty === true) {
+      bodyRows += row(pts.penalty > 0, '🥅', 'Penalty prédit', pts.penalty > 0 ? 'Il y a eu penalty' : 'Pas de penalty', pts.penalty > 0 ? '+1' : '0');
+    }
+    if (Number(prono.redCards) > 0) {
+      bodyRows += row(pts.redCards > 0, '🟥', 'Cartons rouges', pts.redCards > 0 ? `Bon compte (${real.redCards})` : `Prédit ${prono.redCards} · réel ${real.redCards ?? '?'}`, pts.redCards > 0 ? '+1' : '0');
+    }
+
+    totalHtml = `<div class="pdt-total">Total <b>${pts.total} pt${pts.total > 1 ? 's' : ''}</b></div>`;
+  }
+
+  // Hero façon onglet Matchs : drapeaux ronds + score énorme + pilule d'état
+  const flagEl = (info) => {
+    const src = (typeof getFlagImg === 'function') ? getFlagImg(info?.code) : null;
+    return src
+      ? `<img class="mr-flag-img" src="${src}" alt="">`
+      : `<span class="mr-flag-emoji">${info?.flag || '🏳️'}</span>`;
+  };
+  const scoreDisp = real?.score ? real.score.replace('-', ' – ') : null;
+  const heroMid = scoreDisp
+    ? `<div class="mr-score">${scoreDisp}</div><div class="mr-status">Terminé</div>`
+    : `<div class="mr-time">${m.t}</div><div class="mr-status">${m.d}</div>`;
+
+  const html = `
+    <div class="pdt-wrap">
+      <div class="mr-card pdt-hero">
+        <div class="mr-team">${flagEl(hInfo)}<span class="mr-name">${m.h}</span></div>
+        <div class="mr-mid">${heroMid}</div>
+        <div class="mr-team">${flagEl(aInfo)}<span class="mr-name">${m.a}</span></div>
+      </div>
+      <div class="pdt-user">
+        ${typeof getAvatarHtml === 'function' ? getAvatarHtml(pseudo, users, 44) : ''}
+        <div class="pdt-user-txt">
+          <div class="pdt-pseudo">${pseudo}</div>
+          <div class="pdt-user-lbl">Son pronostic</div>
+        </div>
+        <div class="pdt-user-prono">${pronoLbl}</div>
+      </div>
+      ${bodyRows}
+      ${totalHtml}
+      <div class="pdt-bareme">Barème : score exact <b>+3</b> · bon vainqueur <b>+1</b> · buteur <b>+1</b> chacun (tous trouvés <b>+5</b>) · penalty <b>+1</b> · cartons rouges <b>+1</b></div>
+      <button class="prono-submit-btn" style="margin-top:16px;width:100%" onclick="openPseudoPronos('${pseudo.replace(/'/g, "\\'")}')">Voir tous ses pronos</button>
+    </div>`;
+
+  if (typeof openPanel === 'function') openPanel(html, `Pronostic de ${pseudo}`);
 }
 
 // ── SAVE USER PRONOSTIC ────────────────────────────────────────────────────
@@ -382,14 +650,14 @@ function _buildScorersBlock(key, hPlayers, aPlayers, hVal, aVal, savedH, savedA,
   if (hVal > 0 || isAdm) {
     const cid = `${prefix}-hs-${key}`;
     html += `<div class="prono-scorer-row">
-      <div class="prono-scorer-label">⚽ Buteurs Dom.${hVal > 0 && !isAdm ? ` (max ${hVal})` : ''}</div>
+      <div class="prono-scorer-label">Buteurs Dom.${hVal > 0 && !isAdm ? ` (max ${hVal})` : ''}</div>
       <div class="prono-pills" id="${cid}">${_buildPills(cid, hPlayers, savedH, `${prefix === 'ad' ? 'ah' : 'ph'}-${key}`, isAdm)}</div>
     </div>`;
   }
   if (aVal > 0 || isAdm) {
     const cid = `${prefix}-as-${key}`;
     html += `<div class="prono-scorer-row">
-      <div class="prono-scorer-label">⚽ Buteurs Ext.${aVal > 0 && !isAdm ? ` (max ${aVal})` : ''}</div>
+      <div class="prono-scorer-label">Buteurs Ext.${aVal > 0 && !isAdm ? ` (max ${aVal})` : ''}</div>
       <div class="prono-pills" id="${cid}">${_buildPills(cid, aPlayers, savedA, `${prefix === 'ad' ? 'aa' : 'pa'}-${key}`, isAdm)}</div>
     </div>`;
   }
@@ -512,7 +780,7 @@ function getPronoSection(scoreKey, homeTeam, awayTeam, hPool, aPool, realScore) 
       const medal = userPts.total >= 9 ? '🏆' : userPts.total >= 5 ? '⭐' : userPts.total >= 3 ? '✅' : userPts.total >= 1 ? '👍' : '😔';
       inner += `
       <div class="prono-block prono-result-block">
-        <div class="prono-block-title">📊 Ton pronostic ${medal}</div>
+        <div class="prono-block-title">Ton pronostic ${medal}</div>
         <div class="prono-result-row">
           <div class="prono-result-left">
             <div class="prono-result-score">${userProno.score || '—'}</div>
@@ -547,7 +815,7 @@ function getPronoSection(scoreKey, homeTeam, awayTeam, hPool, aPool, realScore) 
       const initANum = isNaN(initAVal) ? '' : initAVal;
       inner += `
       <div class="prono-block prono-form-block">
-        <div class="prono-block-title">📊 Ton pronostic</div>
+        <div class="prono-block-title">Ton pronostic</div>
         <div class="prono-score-row">
           <span class="prono-team-lbl">${homeTeam}</span>
           <input type="number" id="ph-${scoreKey}" class="prono-score-inp" min="0" max="30"
@@ -605,7 +873,7 @@ function renderLeaderboard() {
   if (!container) return;
 
   const board   = getLeaderboard();
-  const real    = loadReal();
+  const real    = _effectiveReal();
   const maxPts  = board.length ? Math.max(...board.map(e => e.total), 1) : 1;
   const medals  = ['🥇', '🥈', '🥉'];
 
@@ -625,7 +893,7 @@ function renderLeaderboard() {
   container.innerHTML = `
   <div class="ldb-wrap">
     <div class="ldb-hero">
-      <div class="ldb-hero-title">🏆 CLASSEMENT</div>
+      <div class="ldb-hero-title">CLASSEMENT</div>
       <div class="ldb-hero-sub">${board.length} joueur${board.length > 1 ? 's' : ''} · ${Object.keys(real).length} match${Object.keys(real).length > 1 ? 's' : ''} joué${Object.keys(real).length > 1 ? 's' : ''}</div>
       ${myRank ? `<div class="ldb-my-rank">Ta position : <strong>#${myRank}</strong></div>` : ''}
     </div>
@@ -657,31 +925,12 @@ function renderLeaderboard() {
     </div>
   </div>`;
 
-  // Animate bars + counters
+  // Animation des barres uniquement. Le nombre de points est rendu directement
+  // dans l'HTML (= total exact) : pas d'animation de compteur qui se désynchronise.
   requestAnimationFrame(() => {
     setTimeout(() => {
       container.querySelectorAll('.ldb-bar-inner').forEach(bar => {
         bar.style.width = bar.dataset.w + '%';
-      });
-      container.querySelectorAll('.ldb-pts-main').forEach((el, i) => {
-        const target = parseInt(el.textContent);
-        if (!target) return;
-        el.dataset.target = target;
-        el.textContent = '0 ';
-        const unit = document.createElement('span');
-        unit.className = 'ldb-pts-unit';
-        unit.textContent = 'pts';
-        el.appendChild(unit);
-        const start = performance.now();
-        const d = 900;
-        const step = ts => {
-          const p = Math.min((ts - start) / d, 1);
-          const eased = 1 - Math.pow(1 - p, 3);
-          el.firstChild.textContent = Math.round(target * eased) + ' ';
-          if (p < 1) requestAnimationFrame(step);
-          else el.firstChild.textContent = target + ' ';
-        };
-        setTimeout(() => requestAnimationFrame(step), i * 60);
       });
     }, 100);
   });
@@ -702,15 +951,32 @@ function ldbTogglePronos(card, pseudo) {
   arrow.style.transform = 'rotate(90deg)';
   drawer.innerHTML = _renderPronosForUser(pseudo);
   drawer.style.maxHeight = drawer.scrollHeight + 'px';
+  // libère la hauteur après l'animation pour laisser les détails se déplier
+  setTimeout(() => { if (card.classList.contains('ldb-open')) drawer.style.maxHeight = 'none'; }, 400);
+}
+
+// Déplie/replie le détail d'un prono (score réel, buteurs, cartons)
+function ldbToggleDetail(row) {
+  const detail = row.nextElementSibling;
+  if (!detail || !detail.classList.contains('ldb-pd-detail')) return;
+  const open = detail.style.display !== 'none';
+  detail.style.display = open ? 'none' : '';
+  row.classList.toggle('ldb-pd-row--open', !open);
 }
 
 function _renderPronosForUser(pseudo) {
   const users = loadUsers();
-  const real  = loadReal();
+  const real  = _effectiveReal();
   const u     = users[pseudo];
   const pronos = { ...(u?.pronos || {}), ...(u?.pronostics || {}) };
   const entries = Object.entries(pronos);
   if (!entries.length) return '<div class="ldb-pd-empty">Aucun pronostic</div>';
+
+  // tri : matchs notés d'abord, puis à venir
+  entries.sort(([ka], [kb]) => {
+    const a = real[ka] ? 0 : 1, b = real[kb] ? 0 : 1;
+    return a - b;
+  });
 
   return `<div class="ldb-pd-list">${entries.map(([key, prono]) => {
     const gId  = key.split('_')[0];
@@ -718,21 +984,59 @@ function _renderPronosForUser(pseudo) {
     const group = GROUPS.find(g => g.id === gId);
     const match = group?.matches[mIdx];
     if (!match) return '';
-    const realScore = real[key];
-    const pts = realScore ? scorePoints(prono, realScore) : null;
-    let ptsClass = 'ldb-pd-pts--pending';
-    let ptsLabel = '–';
-    if (pts) {
-      ptsLabel = '+' + pts.total;
-      ptsClass = pts.total >= 10 ? 'ldb-pd-pts--exact' : pts.total > 0 ? 'ldb-pd-pts--good' : 'ldb-pd-pts--miss';
-    }
     const hInfo = group.teams.find(t => t.name === match.h);
     const aInfo = group.teams.find(t => t.name === match.a);
-    return `<div class="ldb-pd-row">
-      <span class="ldb-pd-teams">${hInfo?.flag||''}${match.h} <em>vs</em> ${match.a}${aInfo?.flag||''}</span>
-      <span class="ldb-pd-score">${_pronoLabel(prono, match)}</span>
-      ${realScore ? `<span class="ldb-pd-real">${realScore.score || ''}</span>` : '<span class="ldb-pd-real ldb-pd-real--pending">à jouer</span>'}
-      <span class="ldb-pd-pts ${ptsClass}">${ptsLabel}</span>
+
+    const liveScore = (typeof state !== 'undefined' && state.scores) ? state.scores[key] : null;
+    const realObj = real[key] || null;
+    const realScore = realObj?.score || null;
+    const inProgress = !realScore && liveScore;
+    const pts = realObj ? scorePoints(prono, realObj) : null;
+
+    // statut + couleur des points
+    let badge, badgeCls;
+    if (pts) {
+      badge = '+' + pts.total + ' pt' + (pts.total > 1 ? 's' : '');
+      badgeCls = pts.score === 3 ? 'ldb-b-exact' : pts.total > 0 ? 'ldb-b-good' : 'ldb-b-miss';
+    } else if (inProgress) {
+      badge = 'en direct'; badgeCls = 'ldb-b-live';
+    } else {
+      badge = 'à jouer'; badgeCls = 'ldb-b-pending';
+    }
+
+    const resultStr = realScore || (inProgress ? liveScore : null);
+
+    // détail : ce qui a rapporté, comme la popup openPronoDetail mais inline
+    let detailHtml = '';
+    if (pts) {
+      const rows = [];
+      if (pts.score === 3) rows.push(['Score exact', '+3', true]);
+      else if (pts.winner) rows.push(['Bon vainqueur', '+1', true]);
+      else rows.push(['Vainqueur', '0', false]);
+      if (pts.scorers > 0) rows.push([pts.scorers >= 5 ? 'Tous les buteurs' : (pts.scorers + ' buteur' + (pts.scorers > 1 ? 's' : '')), '+' + pts.scorers, true]);
+      if (pts.penalty) rows.push(['Penalty', '+1', true]);
+      if (pts.redCards) rows.push(['Cartons rouges', '+1', true]);
+      detailHtml = rows.map(([l, p, ok]) =>
+        `<div class="ldb-dl ${ok ? 'ok' : ''}"><span>${l}</span><b>${p}</b></div>`).join('');
+    } else {
+      detailHtml = `<div class="ldb-dl"><span>${match.d} · ${match.t}</span><b></b></div>`;
+    }
+
+    return `<div class="ldb-pd-item">
+      <div class="ldb-pd-card" onclick="event.stopPropagation();ldbToggleDetail(this)">
+        <div class="ldb-pd-teams">
+          <span class="ldb-pd-fl">${hInfo?.flag || ''}</span>
+          <span class="ldb-pd-cd">${hInfo?.code || match.h}</span>
+          <span class="ldb-pd-vs">${resultStr ? resultStr.replace('-', ' - ') : 'v'}</span>
+          <span class="ldb-pd-cd">${aInfo?.code || match.a}</span>
+          <span class="ldb-pd-fl">${aInfo?.flag || ''}</span>
+        </div>
+        <div class="ldb-pd-foot">
+          <span class="ldb-pd-prono">Prono <b>${_pronoLabel(prono, match)}</b></span>
+          <span class="ldb-pd-badge ${badgeCls}">${badge}</span>
+        </div>
+      </div>
+      <div class="ldb-pd-detail" style="display:none">${detailHtml}</div>
     </div>`;
   }).join('')}</div>`;
 }
@@ -769,7 +1073,9 @@ function _renderUserHistory() {
 // ── INIT ──────────────────────────────────────────────────────────────────
 (function initPronosticSystem() {
   const saved = localStorage.getItem(SESSION_KEY);
-  if (saved) {
+  if (saved && isRemovedPseudo(saved)) {
+    localStorage.removeItem(SESSION_KEY);
+  } else if (saved) {
     currentPseudo = saved;
     pronoIsAdmin  = (saved === ADMIN_PSEUDO);
   }
@@ -782,6 +1088,14 @@ function _renderUserHistory() {
 
   function _onReady() {
     _updatePseudoIndicator();
+
+    // Sync cloud au démarrage (pronos + classement multi-appareils)
+    cloudPullAll().then(ok => {
+      if (ok) {
+        _updatePseudoIndicator();
+        _refreshAfterAuth();
+      }
+    });
 
     // If no pseudo after splash (4.5s), show modal once
     if (!currentPseudo) {

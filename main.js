@@ -1606,10 +1606,35 @@ const PALMARES = {
 };
 
 // ── APP STATE ─────────────────────────────────────────────────────────
-// ── CONFIG NAS ────────────────────────────────────────────────────────
-// Remplace par l'IP de ton DS211 sur le réseau local
+// ── CONFIG LIVE ───────────────────────────────────────────────────────
+// Source primaire : API ESPN directe (CORS ouvert). Fallback : NAS local.
+const ESPN_SCOREBOARD_URL = 'https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard';
+
+// Résumés vidéo (YouTube beIN Sports). Clé = scoreKey "A_0".
+// À compléter au fil des matchs ; sinon lien de recherche YouTube auto.
+const MATCH_VIDEOS = {
+  'A_1': 'https://youtu.be/YQoCE9_WgAs',
+};
+// Lien dispo 1h après la fin du match
+function getMatchVideoUrl(key, m) {
+  if (MATCH_VIDEOS[key]) return MATCH_VIDEOS[key];
+  const q = encodeURIComponent(`beIN Sports ${m.h} - ${m.a}`);
+  return `https://www.youtube.com/results?search_query=${q}`;
+}
+function isMatchVideoReady(m) {
+  if (!m.utc) return false;
+  const end = new Date(m.utc).getTime() + (115 + 60) * 60 * 1000; // ~fin + 1h
+  return Date.now() >= end;
+}
 const NAS_SCORES_URL = 'http://192.168.1.100/wc2026/scores.json';
-const LIVE_POLL_INTERVAL = 60000; // 60 secondes
+const LIVE_POLL_INTERVAL = 45000; // 45s — but/carton affiché en moins d'une minute
+
+// Migration calendrier réel (v2) : les anciens scores étaient keyés sur un
+// ordre de matchs obsolète — on repart propre, l'API ESPN repeuple tout.
+if (!localStorage.getItem('wc2026_schedule_v2')) {
+  ['wc2026_scores','wc2026_scorers','wc2026_goalMeta','wc2026_matchDetails'].forEach(k => localStorage.removeItem(k));
+  localStorage.setItem('wc2026_schedule_v2', '1');
+}
 
 const state = {
   view: 'groups',
@@ -1618,6 +1643,7 @@ const state = {
   scorers:      JSON.parse(localStorage.getItem('wc2026_scorers')      || '{}'),
   goalMeta:     JSON.parse(localStorage.getItem('wc2026_goalMeta')     || '{}'),
   matchDetails: JSON.parse(localStorage.getItem('wc2026_matchDetails') || '{}'),
+  liveInfo:     {},   // scoreKey → { state:'pre'|'in'|'post', clock, detail }
   nasConnected: false,
   lastNasUpdate: null,
 };
@@ -1639,6 +1665,9 @@ const VENUE_CAPACITY = {
   'Hard Rock Stadium, Miami':           65326,
   'Camping World Stadium, Orlando':     60219,
   'Estadio BBVA, Monterrey':            51350,
+  'NRG Stadium, Houston':               72220,
+  'Mercedes-Benz Stadium, Atlanta':     71000,
+  'Lumen Field, Seattle':               68740,
 };
 
 // ── MAPPING noms ESPN (EN) → noms app (FR) ────────────────────────────
@@ -1657,102 +1686,343 @@ const ESPN_TO_FR = {
   'Ghana':'Ghana','Panama':'Panamá','Slovenia':'Slovénie','Scotland':'Écosse',
   'Ecuador':'Équateur','Paraguay':'Paraguay','Norway':'Norvège',
   'Cape Verde':'Cap-Vert','United States':'États-Unis','USA':'États-Unis',
+  'Czechia':'Rép. tchèque','Czech Republic':'Rép. tchèque',
+  'Türkiye':'Turquie','Turkey':'Turquie','Sweden':'Suède','Iraq':'Irak',
+  'Haiti':'Haïti','Bosnia-Herzegovina':'Bosnie-Herzégovine',
+  'Congo DR':'RD Congo','DR Congo':'RD Congo','Curaçao':'Curaçao',
 };
 
 // ── LIVE SCORES FETCH ─────────────────────────────────────────────────
-async function fetchLiveScores() {
+// Normalise un event ESPN brut → { home, away, homeScore, awayScore,
+// status, clock, completed, goals/cards par camp }
+function _normalizeEspnEvent(e) {
+  const comp = (e.competitions || [])[0] || {};
+  const cs = comp.competitors || [];
+  const home = cs.find(c => c.homeAway === 'home') || {};
+  const away = cs.find(c => c.homeAway === 'away') || {};
+  const st = (e.status || {}).type || {};
+  const homeId = home.team?.id, awayId = away.team?.id;
+
+  const goals = { home: [], away: [] };
+  const yellows = { home: [], away: [] };
+  const reds = { home: [], away: [] };
+
+  (comp.details || []).forEach(d => {
+    const typeTxt = (d.type?.text || '').toLowerCase();
+    const min = d.clock?.displayValue || '';
+    const who = (d.athletesInvolved || [])[0]?.displayName || '';
+    let side = String(d.team?.id) === String(homeId) ? 'home' : 'away';
+    if (d.scoringPlay) {
+      const own = typeTxt.includes('own goal');
+      if (own) side = side === 'home' ? 'away' : 'home';
+      const pen = typeTxt.includes('penalty');
+      goals[side].push(`${min} ${who}${own ? ' (csc)' : pen ? ' (pen)' : ''}`.trim());
+    } else if (d.yellowCard || typeTxt.includes('yellow')) {
+      yellows[side].push(`${min} ${who}`.trim());
+    } else if (d.redCard || typeTxt.includes('red')) {
+      reds[side].push(`${min} ${who}`.trim());
+    }
+  });
+
+  return {
+    id: e.id,
+    home: home.team?.displayName || '',
+    away: away.team?.displayName || '',
+    homeScore: home.score, awayScore: away.score,
+    status: st.state || '',
+    clock: (e.status || {}).displayClock || '',
+    detail: st.shortDetail || '',
+    completed: !!st.completed,
+    goals, yellows, reds,
+  };
+}
+
+async function fetchLiveScores(dateRange) {
+  let events = null;
+  let source = 'espn';
+
+  // 1) API ESPN directe (dateRange optionnel : 'YYYYMMDD-YYYYMMDD' pour backfill)
   try {
-    const res = await fetch(NAS_SCORES_URL + '?t=' + Date.now(), {
+    const url = ESPN_SCOREBOARD_URL + (dateRange ? `?dates=${dateRange}&limit=200&t=` : '?t=') + Date.now();
+    const res = await fetch(url, {
       cache: 'no-store',
-      signal: AbortSignal.timeout(8000)
+      signal: AbortSignal.timeout(dateRange ? 15000 : 8000)
     });
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const data = await res.json();
-    const events = data.events || [];
+    events = (data.events || []).map(_normalizeEspnEvent);
+  } catch (err) {
+    console.warn('[LIVE] ESPN fetch failed:', err.message);
+  }
 
-    let changed = false;
-
-    events.forEach(ev => {
-      const homeFR = ESPN_TO_FR[ev.home] || ev.home;
-      const awayFR = ESPN_TO_FR[ev.away] || ev.away;
-
-      // Trouver la clé dans nos groupes
-      let foundKey = null;
-      GROUPS.forEach(g => {
-        g.matches.forEach((m, i) => {
-          if ((m.h === homeFR && m.a === awayFR) ||
-              (m.h === awayFR && m.a === homeFR)) {
-            foundKey = g.id + '_' + i;
-          }
-        });
+  // 2) Fallback NAS (format pré-normalisé, sans buteurs)
+  if (!events) {
+    source = 'nas';
+    try {
+      const res = await fetch(NAS_SCORES_URL + '?t=' + Date.now(), {
+        cache: 'no-store',
+        signal: AbortSignal.timeout(8000)
       });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      events = data.events || [];
+    } catch (err) {
+      console.warn('[LIVE] NAS fetch failed:', err.message);
+      state.nasConnected = false;
+      updateNasIndicator(false);
+      return;
+    }
+  }
 
-      if (!foundKey) return;
+  let changed = false;
 
-      // Score disponible ?
-      const hScore = ev.homeScore;
-      const aScore = ev.awayScore;
-      if (hScore === '' || aScore === '' || hScore == null) return;
+  events.forEach(ev => {
+    const homeFR = ESPN_TO_FR[ev.home] || ev.home;
+    const awayFR = ESPN_TO_FR[ev.away] || ev.away;
 
-      // Inverser si ESPN a les équipes dans l'ordre inverse
-      const g = GROUPS.flatMap(gr => gr.matches).find(m =>
-        m.h === homeFR && m.a === awayFR
-      );
-      const newScore = (g || ev.home === homeFR)
-        ? `${hScore}-${aScore}`
-        : `${aScore}-${hScore}`;
-
-      const oldScore = state.scores[foundKey] || '';
-
-      if (newScore !== oldScore && (ev.status === 'in' || ev.status === 'post' || ev.completed)) {
-        // Détecter quel camp a marqué
-        const oldParts = oldScore.split('-').map(s => parseInt(s) || 0);
-        const newParts = newScore.split('-').map(s => parseInt(s) || 0);
-        let lastTeam = null;
-        if (newParts[0] > oldParts[0]) lastTeam = 'home';
-        else if (newParts[1] > oldParts[1]) lastTeam = 'away';
-
-        state.scores[foundKey] = newScore;
-        liveUpdateGroupScore(foundKey);
-        if (lastTeam) {
-          state.goalMeta[foundKey] = { changedAt: Date.now(), lastTeam };
-          setTimeout(() => { renderCalendar(); renderLiveView(); }, 5100);
-        }
-        changed = true;
-      }
+    // Trouver la clé dans nos groupes
+    let foundKey = null, swapped = false;
+    GROUPS.forEach(g => {
+      g.matches.forEach((m, i) => {
+        if (m.h === homeFR && m.a === awayFR) { foundKey = g.id + '_' + i; swapped = false; }
+        else if (m.h === awayFR && m.a === homeFR) { foundKey = g.id + '_' + i; swapped = true; }
+      });
     });
+    if (!foundKey) return;
 
-    state.nasConnected = true;
-    state.lastNasUpdate = new Date();
+    // Statut + chrono live (toujours, même sans score)
+    state.liveInfo[foundKey] = {
+      state: ev.completed ? 'post' : (ev.status || 'pre'),
+      clock: ev.clock || '',
+      detail: ev.detail || '',
+      eventId: ev.id || (state.liveInfo[foundKey] || {}).eventId || null,
+    };
 
-    if (changed) {
-      saveScores();
-      renderCalendar();
-      renderLiveView();
-      renderGroups();
+    // Buteurs + cartons (ESPN uniquement)
+    if (ev.goals) {
+      const pick = (o) => swapped ? { home: o.away, away: o.home } : { home: o.home, away: o.away };
+      const goals = pick(ev.goals);
+      if (goals.home.length || goals.away.length ||
+          (state.scorers[foundKey] && JSON.stringify(state.scorers[foundKey]) !== JSON.stringify(goals))) {
+        if (JSON.stringify(state.scorers[foundKey] || null) !== JSON.stringify(goals)) {
+          state.scorers[foundKey] = goals;
+          changed = true;
+        }
+      }
+      const yellows = pick(ev.yellows), reds = pick(ev.reds);
+      if (yellows.home.length || yellows.away.length || reds.home.length || reds.away.length) {
+        const d = state.matchDetails[foundKey] || (state.matchDetails[foundKey] = {});
+        if (JSON.stringify(d.yellows || null) !== JSON.stringify(yellows) ||
+            JSON.stringify(d.reds || null) !== JSON.stringify(reds)) {
+          d.yellows = yellows;
+          d.reds = reds;
+          changed = true;
+        }
+      }
     }
 
-    updateNasIndicator(true);
-  } catch (err) {
-    console.warn('[NAS] Scores fetch failed:', err.message);
-    state.nasConnected = false;
-    updateNasIndicator(false);
+    // Score disponible ?
+    const hScore = ev.homeScore;
+    const aScore = ev.awayScore;
+    if (hScore === '' || aScore === '' || hScore == null) return;
+
+    const newScore = swapped ? `${aScore}-${hScore}` : `${hScore}-${aScore}`;
+    const oldScore = state.scores[foundKey] || '';
+
+    if (newScore !== oldScore && (ev.status === 'in' || ev.status === 'post' || ev.completed)) {
+      // Détecter quel camp a marqué
+      const oldParts = oldScore.split('-').map(s => parseInt(s) || 0);
+      const newParts = newScore.split('-').map(s => parseInt(s) || 0);
+      let lastTeam = null;
+      if (newParts[0] > oldParts[0]) lastTeam = 'home';
+      else if (newParts[1] > oldParts[1]) lastTeam = 'away';
+
+      state.scores[foundKey] = newScore;
+      liveUpdateGroupScore(foundKey);
+      if (lastTeam) {
+        state.goalMeta[foundKey] = { changedAt: Date.now(), lastTeam };
+        setTimeout(() => { renderCalendar(); renderLiveView(); }, 5100);
+      }
+      changed = true;
+    }
+  });
+
+  state.nasConnected = true;
+  state.lastNasUpdate = new Date();
+
+  if (changed) {
+    saveScores();
+    renderCalendar();
+    renderLiveView();
+    renderGroups();
+  } else if (state.view === 'live') {
+    // Rafraîchit le chrono même sans but
+    renderLiveView();
   }
+  // Toujours recalculer le classement s'il est affiché : garantit que le total
+  // visible = total réel même si des scores arrivent après le 1er rendu.
+  if (state.view === 'classement' && typeof renderLeaderboard === 'function') renderLeaderboard();
+
+  updateNasIndicator(true, source);
 }
 
-function updateNasIndicator(ok) {
+function updateNasIndicator(ok, source) {
   const btn = document.getElementById('nav-live-btn');
   if (btn) {
     btn.title = ok
-      ? `LIVE — NAS connecté (${new Date().toLocaleTimeString()})`
-      : 'LIVE — NAS non disponible';
+      ? `LIVE — ${source === 'nas' ? 'NAS' : 'ESPN'} connecté (${new Date().toLocaleTimeString()})`
+      : 'LIVE — source scores non disponible';
     btn.style.opacity = ok ? '1' : '0.5';
   }
 }
 
+// ── RÉSUMÉ DE MATCH (page stats après clic sur un match joué) ─────────
+function gpMatchClick(gid, i) {
+  const key = gid + '_' + i;
+  if (state.scores[key] && window.matchMedia('(max-width: 768px)').matches) {
+    openMatchSummary(gid, i);
+  } else {
+    openMatchPitchPanel(gid, i);
+  }
+}
+
+function openMatchSummary(gid, i) {
+  const g = GROUPS.find(x => x.id === gid);
+  const m = g?.matches[i];
+  if (!m) return;
+  const key = gid + '_' + i;
+  const score = state.scores[key] || m.s || '–';
+  const hInfo = g.teams.find(t => t.name === m.h);
+  const aInfo = g.teams.find(t => t.name === m.a);
+  const sc = state.scorers[key] || { home: [], away: [] };
+  const det = state.matchDetails[key] || {};
+  const scoreDisp = score && score.includes('-') ? score.replace('-', ' – ') : score;
+
+  // drapeaux ronds comme l'onglet Matchs
+  const flagEl = (info) => {
+    const src = getFlagImg(info?.code);
+    return src ? `<img class="mr-flag-img" src="${src}" alt="">` : `<span class="mr-flag-emoji">${info?.flag || '🏳️'}</span>`;
+  };
+
+  // événements groupés : 1 chip = icône + minute + nom, ligne par camp
+  const evChips = (side) => {
+    const fmt = (n) => {
+      const mn = (n.match(/^(\d+'(?:\+\d+')?)/) || [])[1] || '';
+      const nm = n.replace(/^\d+'(?:\+\d+')?\s*/, '');
+      return `<span class="ms-min">${mn}</span><span class="ms-who">${nm}</span>`;
+    };
+    const rows = [
+      ...(sc[side] || []).map(n => `<div class="ms-ev ms-ev-goal">⚽ ${fmt(n)}</div>`),
+      ...(det.yellows?.[side] || []).map(n => `<div class="ms-ev">🟨 ${fmt(n)}</div>`),
+      ...(det.reds?.[side] || []).map(n => `<div class="ms-ev">🟥 ${fmt(n)}</div>`),
+    ];
+    return rows.join('');
+  };
+  const hasEvents = (sc.home?.length || sc.away?.length || det.yellows?.home?.length ||
+    det.yellows?.away?.length || det.reds?.home?.length || det.reds?.away?.length);
+
+  const html = `
+    <div class="ms-wrap">
+      <div class="mr-card ms-hero-card">
+        <div class="mr-team">${flagEl(hInfo)}<span class="mr-name">${m.h}</span></div>
+        <div class="mr-mid"><div class="mr-score">${scoreDisp}</div><div class="mr-status">${score && score !== '–' ? 'Terminé' : m.t}</div></div>
+        <div class="mr-team">${flagEl(aInfo)}<span class="mr-name">${m.a}</span></div>
+      </div>
+      <div class="ms-meta">${m.d} · ${m.t} · ${m.v}</div>
+      ${hasEvents ? `
+      <div class="ms-section">
+        <div class="ms-section-title">Faits du match</div>
+        <div class="ms-events">
+          <div class="ms-ev-col">${evChips('home') || '<div class="ms-ev ms-ev-none">—</div>'}</div>
+          <div class="ms-ev-sep"></div>
+          <div class="ms-ev-col ms-ev-away">${evChips('away') || '<div class="ms-ev ms-ev-none">—</div>'}</div>
+        </div>
+      </div>` : ''}
+      <div class="ms-section ms-stats" id="ms-stats">
+        <div class="ms-loading">Chargement des statistiques…</div>
+      </div>
+    </div>`;
+
+  openPanel(html, `${hInfo?.flag || ''} ${m.h} – ${m.a} ${aInfo?.flag || ''}`);
+  _fillMatchStats(key);
+}
+
+async function _fillMatchStats(key) {
+  const box = document.getElementById('ms-stats');
+  if (!box) return;
+  const eventId = state.liveInfo[key]?.eventId;
+  if (!eventId) { box.innerHTML = '<div class="ms-loading">Statistiques non disponibles</div>'; return; }
+  try {
+    const res = await fetch(`https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/summary?event=${eventId}`,
+      { signal: AbortSignal.timeout(10000) });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const d = await res.json();
+    const teams = d.boxscore?.teams || [];
+    const home = teams.find(t => t.homeAway === 'home') || teams[0];
+    const away = teams.find(t => t.homeAway === 'away') || teams[1];
+    if (!home || !away) throw new Error('no boxscore');
+
+    const WANT = [
+      ['possessionPct',  'Possession',     '%'],
+      ['totalShots',     'Tirs',           ''],
+      ['shotsOnTarget',  'Tirs cadrés',    ''],
+      ['totalPasses',    'Passes',         ''],
+      ['accuratePasses', 'Passes réussies',''],
+      ['wonCorners',     'Corners',        ''],
+      ['foulsCommitted', 'Fautes',         ''],
+      ['offsides',       'Hors-jeu',       ''],
+      ['saves',          'Arrêts',         ''],
+      ['yellowCards',    'Cartons jaunes', ''],
+      ['redCards',       'Cartons rouges', ''],
+    ];
+    const val = (t, name) => t.statistics?.find(s => s.name === name)?.displayValue ?? '–';
+
+    // header : titre à gauche, bouton vidéo à droite (1h après la fin)
+    const _kp = key.split('_');
+    const _g = GROUPS.find(x => x.id === _kp[0]);
+    const _m = _g?.matches[parseInt(_kp[1])];
+    const videoBtn = (_m && isMatchVideoReady(_m))
+      ? `<a class="ms-video-btn" href="${getMatchVideoUrl(key, _m)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">
+           <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg> Vidéo
+         </a>`
+      : '';
+
+    box.innerHTML = `
+      <div class="ms-stats-head">
+        <div class="ms-section-title ms-section-title-plain">Statistiques</div>
+        ${videoBtn}
+      </div>
+      ${WANT.map(([name, label, suffix]) => {
+        const hv = val(home, name), av = val(away, name);
+        const hn = parseFloat(hv) || 0, an = parseFloat(av) || 0;
+        const tot = hn + an || 1;
+        const hWin = hn > an, aWin = an > hn;
+        return `
+        <div class="ms-stat-row">
+          <span class="ms-sv ${hWin ? 'ms-sv-win' : ''}">${hv}${suffix}</span>
+          <div class="ms-stat-mid">
+            <div class="ms-stat-label">${label}</div>
+            <div class="ms-stat-bar">
+              <div class="ms-bar-h" style="width:${Math.round(hn / tot * 100)}%"></div>
+              <div class="ms-bar-a" style="width:${Math.round(an / tot * 100)}%"></div>
+            </div>
+          </div>
+          <span class="ms-sv ${aWin ? 'ms-sv-win' : ''}">${av}${suffix}</span>
+        </div>`;
+      }).join('')}`;
+  } catch (e) {
+    console.warn('[STATS]', e.message);
+    box.innerHTML = '<div class="ms-loading">Statistiques non disponibles</div>';
+  }
+}
+
 function startLivePolling() {
-  fetchLiveScores();
-  setInterval(fetchLiveScores, LIVE_POLL_INTERVAL);
+  // Backfill : les matchs passés sortent du scoreboard du jour — on récupère
+  // tout l'historique depuis l'ouverture (11 juin) au premier chargement.
+  const now = new Date();
+  const ymd = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`;
+  fetchLiveScores('20260611-' + ymd);
+  setInterval(() => fetchLiveScores(), LIVE_POLL_INTERVAL);
 }
 
 // ── HELPERS ───────────────────────────────────────────────────────────
@@ -1894,14 +2164,38 @@ function promptMatchDetail(scoreKey, field) {
 
 // ── LIVE DETECTION ────────────────────────────────────────────────────
 const MONTHS_FR = {'Janvier':0,'Février':1,'Mars':2,'Avril':3,'Mai':4,'Juin':5,'Juillet':6,'Août':7,'Septembre':8,'Octobre':9,'Novembre':10,'Décembre':11};
+
+let _SK_BY_PAIR = null;
+function scoreKeyForMatch(m) {
+  if (!_SK_BY_PAIR) {
+    _SK_BY_PAIR = {};
+    GROUPS.forEach(g => g.matches.forEach((mm, i) => { _SK_BY_PAIR[mm.h + '|' + mm.a] = g.id + '_' + i; }));
+  }
+  return _SK_BY_PAIR[m.h + '|' + m.a] || null;
+}
+
 function matchLiveStatus(m) {
-  const parts = m.d.split(' ');
-  const day = parseInt(parts[0]);
-  const month = MONTHS_FR[parts[1]] ?? 5;
-  const [h, min] = m.t.split(':').map(Number);
-  const start = new Date(2026, month, day, h, min, 0);
-  const end   = new Date(start.getTime() + 110 * 60 * 1000);
-  const now   = new Date();
+  // 1) Statut temps réel de l'API si dispo (fiable, gère prolongations/retards)
+  const sk = scoreKeyForMatch(m);
+  const li = sk && state.liveInfo[sk];
+  if (li && li.state) {
+    if (li.state === 'in')   return 'live';
+    if (li.state === 'post') return 'finished';
+    if (li.state === 'pre')  return 'upcoming';
+  }
+  // 2) Sinon, horaire réel UTC du match
+  let start;
+  if (m.utc) {
+    start = new Date(m.utc);
+  } else {
+    const parts = m.d.split(' ');
+    const day = parseInt(parts[0]);
+    const month = MONTHS_FR[parts[1]] ?? 5;
+    const [h, min] = m.t.split(':').map(Number);
+    start = new Date(2026, month, day, h, min, 0);
+  }
+  const end = new Date(start.getTime() + 110 * 60 * 1000);
+  const now = new Date();
   if (now >= start && now <= end) return 'live';
   if (now > end) return 'finished';
   return 'upcoming';
@@ -2123,10 +2417,47 @@ function openPanel(html, title) {
   if (drawer) drawer.classList.remove('gp-mode');
   panel.classList.add('open');
   document.body.style.overflow = 'hidden';
+  if (drawer) _initPanelSwipe(drawer);
+}
+
+// Mobile : tirer la poignée (ou le haut du panneau) vers le bas pour fermer
+function _initPanelSwipe(drawer) {
+  if (!window.matchMedia('(max-width: 768px)').matches) return;
+  const grabber = document.getElementById('panel-grabber');
+  const body = document.getElementById('panel-body');
+  if (!grabber) return;
+  let startY = 0, dragging = false, moved = 0;
+
+  const onStart = (e) => {
+    // depuis le haut : poignée/header toujours ; corps seulement si scroll en haut
+    const fromTop = e.target.closest('.panel-grabber, .panel-header');
+    if (!fromTop && (!body || body.scrollTop > 2)) return;
+    startY = e.touches[0].clientY; dragging = true; moved = 0;
+    drawer.style.transition = 'none';
+  };
+  const onMove = (e) => {
+    if (!dragging) return;
+    moved = e.touches[0].clientY - startY;
+    if (moved < 0) moved = 0;
+    if (moved > 0) { drawer.style.transform = `translateY(${moved}px)`; }
+  };
+  const onEnd = () => {
+    if (!dragging) return;
+    dragging = false;
+    drawer.style.transition = '';
+    drawer.style.transform = '';
+    if (moved > 110) closePanel();
+  };
+
+  drawer.ontouchstart = onStart;
+  drawer.ontouchmove = onMove;
+  drawer.ontouchend = onEnd;
 }
 
 function closePanel() {
   const panel = document.getElementById('side-panel');
+  const drawer = document.getElementById('panel-drawer');
+  if (drawer) { drawer.style.transform = ''; drawer.style.transition = ''; }
   if (panel) panel.classList.remove('open');
   document.body.style.overflow = '';
   state.panelStack = [];
@@ -2484,6 +2815,12 @@ function setGroupSlide(groupId, idx) {
   ss.querySelectorAll('.gp-slide-tab').forEach((t, i) => t.classList.toggle('active', i === idx));
 }
 
+function gpNavGroup(groupId, dir) {
+  const ids = GROUPS.map(g => g.id);
+  const next = ids.indexOf(groupId) + dir;
+  if (next >= 0 && next < ids.length) openGroupPanel(ids[next]);
+}
+
 function openGroupPanel(groupId) {
   const group = GROUPS.find(g => g.id === groupId);
   if (!group) return;
@@ -2571,7 +2908,7 @@ function openGroupPanel(groupId) {
       ? `<div class="gp-am-realscore">Score réel : <strong>${score}</strong></div>`
       : '';
     return `
-      <div class="gp-apple-match ${score ? 'played' : ''}" onclick="openMatchPitchPanel('${groupId}',${i})">
+      <div class="gp-apple-match ${score ? 'played' : ''}" onclick="gpMatchClick('${groupId}',${i})">
         ${pronoHtml}
         <div class="gp-am-date">${dateLabel}</div>
         <div class="gp-am-matchup">
@@ -2611,7 +2948,11 @@ function openGroupPanel(groupId) {
           <div class="gp-slide-tabs">${tabsHTML}</div>
         </div>
         <div class="gp-stand-section gp-stand-right">
-          <div class="gp-section-label">CLASSEMENT</div>
+          <div class="gp-section-label gp-nav-label">
+            <button class="gp-nav-btn" onclick="event.stopPropagation();gpNavGroup('${groupId}',-1)">‹</button>
+            <span>GROUPE ${groupId} · CLASSEMENT</span>
+            <button class="gp-nav-btn" onclick="event.stopPropagation();gpNavGroup('${groupId}',1)">›</button>
+          </div>
           <div class="gp-sv2-compact gp-sv2-head">
             <span></span><span></span><span></span>
             <span>MJ</span><span>Diff</span><span class="pts">Pts</span>
@@ -2634,6 +2975,20 @@ function openGroupPanel(groupId) {
   // Enable full-bleed mode: header floats over image, body has no padding
   const _gpDrawer = document.getElementById('panel-drawer');
   if (_gpDrawer) _gpDrawer.classList.add('gp-mode');
+
+  // Mobile : swipe gauche/droite → groupe précédent/suivant
+  if (window.matchMedia('(max-width: 768px)').matches) {
+    const body = document.getElementById('panel-body');
+    if (body) {
+      let _sx = 0, _sy = 0;
+      body.ontouchstart = e => { _sx = e.touches[0].clientX; _sy = e.touches[0].clientY; };
+      body.ontouchend = e => {
+        const dx = e.changedTouches[0].clientX - _sx;
+        const dy = e.changedTouches[0].clientY - _sy;
+        if (Math.abs(dx) > 70 && Math.abs(dy) < 50) gpNavGroup(groupId, dx < 0 ? 1 : -1);
+      };
+    }
+  }
 
   // Init slideshow auto-cycle
   requestAnimationFrame(() => {
@@ -3182,7 +3537,7 @@ function renderCalendarLineup(teamName, flag, teamColor) {
 }
 
 const FIFA_TO_FLAG = {
-  'MEX':'mx','CZE':'cz','KOR':'kr','ZAF':'za','CAN':'ca','SUI':'ch',
+  'MEX':'mx','CZE':'cz','KOR':'kr','ZAF':'za','RSA':'za','CAN':'ca','SUI':'ch',
   'QAT':'qa','BIH':'ba','BRA':'br','MAR':'ma','HAI':'ht','SCO':'gb-sct',
   'USA':'us','AUS':'au','PAR':'py','TUR':'tr','GER':'de','ECU':'ec',
   'CIV':'ci','CUW':'cw','NED':'nl','JPN':'jp','TUN':'tn','SWE':'se',
@@ -3240,6 +3595,17 @@ function openTeamPanel(teamName) {
 
   const html = `
     <div class="tp-showcase">
+      <div class="tp-hero-mobile">
+        <div class="tp-hm-banner">
+          ${bannerSrc
+            ? `<img src="${bannerSrc}" alt="${teamName}" onerror="this.style.display='none'">`
+            : `<div class="tp-banner-fb">${td.flag}</div>`}
+          <div class="tp-hm-country">${td.flag} ${teamName}</div>
+        </div>
+        <div class="tp-hm-player" id="tp-hm-player">
+          ${firstPlayer ? _tpHeroPlayerHtml(firstPlayer, teamName, td) : ''}
+        </div>
+      </div>
       <div class="tp-banner-col">
         ${bannerSrc
           ? `<img src="${bannerSrc}" alt="${teamName}" class="tp-banner-img" onerror="this.parentElement.innerHTML='<div class=tp-banner-fb>${td.flag}</div>'">`
@@ -3254,6 +3620,25 @@ function openTeamPanel(teamName) {
   openPanel(html, `${td.flag} ${teamName}`);
 }
 
+// Moitié droite du hero mobile : photo du joueur sélectionné + stats clés
+function _tpHeroPlayerHtml(p, teamName, td) {
+  const teamColor = getTeamColor(teamName);
+  const cleanName = cleanPlayerName(p.name);
+  const isReal = p.photo && !p.photo.includes('dicebear');
+  const photoHtml = isReal
+    ? `<img class="tp-hm-photo" src="${p.photo}" alt="${cleanName}" onerror="this.src='${getPlayerFallbackUrl(p.name, teamName)}'">`
+    : `<div class="tp-hm-photo-fb" style="background:${teamColor}">${getPlayerInitials(p.name)}</div>`;
+  return `
+    ${photoHtml}
+    <div class="tp-hm-stats">
+      <div class="tp-hm-name">${cleanName}</div>
+      <div class="tp-hm-stat"><b>${p.n || '—'}</b><span>N°</span></div>
+      <div class="tp-hm-stat"><b>${p.goals ?? 0}</b><span>Buts</span></div>
+      <div class="tp-hm-stat"><b>${p.caps ?? 0}</b><span>Sél.</span></div>
+      <div class="tp-hm-stat"><b>${p.age ?? '—'}</b><span>Ans</span></div>
+    </div>`;
+}
+
 function showTeamPlayerDetail(teamName, playerId) {
   const td = getTeamData(teamName);
   if (!td) return;
@@ -3264,6 +3649,23 @@ function showTeamPlayerDetail(teamName, playerId) {
   if (row) row.classList.add('active');
   const col = document.getElementById('tp-detail-col');
   if (col) col.innerHTML = renderTPPlayerDetail(p, teamName, td);
+  const hero = document.getElementById('tp-hm-player');
+  if (hero) hero.innerHTML = _tpHeroPlayerHtml(p, teamName, td);
+  // Mobile : descend automatiquement sur la fiche du joueur
+  if (col && window.matchMedia('(max-width: 768px)').matches) {
+    setTimeout(() => {
+      const body = document.getElementById('panel-body');
+      if (!body) return;
+      const target = body.scrollTop + col.getBoundingClientRect().top - body.getBoundingClientRect().top - 8;
+      // animation manuelle : scrollTo smooth / rAF peu fiables selon contexte
+      const start = body.scrollTop, dist = target - start, t0 = Date.now();
+      const iv = setInterval(() => {
+        const p = Math.min((Date.now() - t0) / 350, 1);
+        body.scrollTop = start + dist * (1 - Math.pow(1 - p, 3));
+        if (p >= 1) clearInterval(iv);
+      }, 16);
+    }, 80);
+  }
 }
 
 function renderTPPlayerDetail(p, teamName, td) {
@@ -3614,9 +4016,90 @@ function openPlayerPanel(teamName, playerId) {
 }
 
 // ── RENDER CALENDAR ───────────────────────────────────────────────────
+// Carte match épurée mobile : drapeaux + équipes + score, rien d'autre
+function renderMatchRowMobile(g, m, i) {
+  const key = g.id + '_' + i;
+  const score = state.scores[key] || m.s;
+  const status = matchLiveStatus(m);
+  const li = state.liveInfo[key];
+  const hInfo = g.teams.find(t => t.name === m.h);
+  const aInfo = g.teams.find(t => t.name === m.a);
+  const flagEl = (info) => {
+    const src = getFlagImg(info?.code);
+    return src
+      ? `<img class="mr-flag-img" src="${src}" alt="" loading="lazy">`
+      : `<span class="mr-flag-emoji">${info?.flag || '🏳️'}</span>`;
+  };
+  const scoreDisp = (score || '').replace('-', ' – ');
+  let mid;
+  if (status === 'live') {
+    mid = `<div class="mr-score mr-live">${scoreDisp || '0 – 0'}</div>
+           <div class="mr-status mr-status-live"><span class="mc-live-dot"></span>LIVE${li?.clock ? ' · ' + li.clock : ''}</div>`;
+  } else if (score) {
+    mid = `<div class="mr-score">${scoreDisp}</div><div class="mr-status">Terminé</div>`;
+  } else {
+    mid = `<div class="mr-time">${m.t}</div><div class="mr-status">Groupe ${g.id}</div>`;
+  }
+  return `
+  <div class="mr-card ${status === 'live' ? 'mr-card-live' : ''}" onclick="gpMatchClick('${g.id}',${i})">
+    <div class="mr-team">${flagEl(hInfo)}<span class="mr-name">${m.h}</span></div>
+    <div class="mr-mid">${mid}</div>
+    <div class="mr-team">${flagEl(aInfo)}<span class="mr-name">${m.a}</span></div>
+  </div>`;
+}
+
 function renderCalendar() {
   const container = document.getElementById('calendar-matches');
   if (!container) return;
+
+  // ── MOBILE : rail de dates vertical + cartes épurées ──
+  if (window.matchMedia('(max-width: 768px)').matches) {
+    const now = new Date();
+    const todayStr = `${now.getDate()} ${['Janvier','Février','Mars','Avril','Mai','Juin','Juillet','Août','Septembre','Octobre','Novembre','Décembre'][now.getMonth()]}`;
+    const dateMin = {};
+    GROUPS.forEach(g => g.matches.forEach(m => {
+      const t = m.utc ? new Date(m.utc).getTime() : 0;
+      if (!(m.d in dateMin) || t < dateMin[m.d]) dateMin[m.d] = t;
+    }));
+    const dates = Object.keys(dateMin).sort((a, b) => dateMin[a] - dateMin[b]);
+    const active = (window._calDate && dates.includes(window._calDate)) ? window._calDate
+      : (dates.includes(todayStr) ? todayStr : dates[0]);
+
+    const railHtml = dates.map(d => {
+      const [day, mon] = d.split(' ');
+      return `<button class="ld-chip ${d === active ? 'active' : ''} ${d === todayStr ? 'today' : ''}"
+        onclick="calSelectDate('${d}')"><b>${day}</b><span>${(mon || '').slice(0, 3)}</span></button>`;
+    }).join('');
+
+    const dayMatches = [];
+    GROUPS.forEach(g => g.matches.forEach((m, i) => { if (m.d === active) dayMatches.push({ g, m, i }); }));
+    dayMatches.sort((a, b) => new Date(a.m.utc || 0) - new Date(b.m.utc || 0));
+
+    const prevRail = document.getElementById('cal-rail');
+    const prevScroll = prevRail ? prevRail.scrollTop : null;
+
+    container.innerHTML = `
+      <div class="live-timeline">
+        <div class="live-rail" id="cal-rail">${railHtml}</div>
+        <div class="live-day-content">
+          <div class="cal-day-label">${active} 2026</div>
+          ${dayMatches.length
+            ? `<div class="mr-list">${dayMatches.map(x => renderMatchRowMobile(x.g, x.m, x.i)).join('')}</div>`
+            : `<div class="live-hero"><div class="live-hero-icon">📅</div><div class="live-hero-title">Pas de match ce jour</div></div>`}
+        </div>
+      </div>`;
+
+    const rail = document.getElementById('cal-rail');
+    if (rail) {
+      if (prevScroll !== null) rail.scrollTop = prevScroll;
+      else {
+        const act = rail.querySelector('.ld-chip.active');
+        if (act) rail.scrollTop = Math.max(act.offsetTop - rail.clientHeight / 2 + 28, 0);
+      }
+    }
+    return;
+  }
+
   const filterGroup = document.getElementById('calendar-filter')?.value || 'all';
   const groups = filterGroup === 'all' ? GROUPS : GROUPS.filter(g => g.id === filterGroup);
   container.innerHTML = groups.map(g => `
@@ -3662,10 +4145,16 @@ function renderMatchCard(g, m, i) {
     ? `<button class="mc-edit-btn" onclick="event.stopPropagation();promptScore('${g.id}',${i},'${m.h.replace(/'/g,"\\'")}','${m.a.replace(/'/g,"\\'")}')">✏️</button>`
     : '';
 
-  const hScorersList = scorers.home.length ? scorers.home.map(s=>`<span class="mc-scorer-name">⚽ ${s}</span>`).join('') : '';
-  const aScorersList = scorers.away.length ? scorers.away.map(s=>`<span class="mc-scorer-name">⚽ ${s}</span>`).join('') : '';
+  const _mcDet = state.matchDetails[scoreKey] || {};
+  const _mcCards = (side) => [
+    ...(_mcDet.yellows?.[side] || []).map(n => `<span class="mc-scorer-name">🟨 ${n}</span>`),
+    ...(_mcDet.reds?.[side]    || []).map(n => `<span class="mc-scorer-name">🟥 ${n}</span>`),
+  ].join('');
+  const hScorersList = (scorers.home.length ? scorers.home.map(s=>`<span class="mc-scorer-name">⚽ ${s}</span>`).join('') : '') + _mcCards('home');
+  const aScorersList = (scorers.away.length ? scorers.away.map(s=>`<span class="mc-scorer-name">⚽ ${s}</span>`).join('') : '') + _mcCards('away');
 
-  const liveBadge = isLive ? `<div class="mc-live-badge"><span class="mc-live-dot"></span>LIVE</div>` : '';
+  const _mcClock = (state.liveInfo[scoreKey]?.clock || '').trim();
+  const liveBadge = isLive ? `<div class="mc-live-badge"><span class="mc-live-dot"></span>LIVE${_mcClock ? ` · ${_mcClock}` : ''}</div>` : '';
   const hInfo = g.teams.find(t => t.name === m.h);
   const aInfo = g.teams.find(t => t.name === m.a);
   const hFlag = hInfo?.flag || '🏳️';
@@ -3829,49 +4318,86 @@ function renderLiveView() {
     });
   });
 
-  if (todayMatches.length === 0) {
-    // Show next match day if no matches today
-    const allFuture = [];
-    GROUPS.forEach(g => g.matches.forEach((m, i) => {
+  // Matchs futurs (hors aujourd'hui), triés chronologiquement
+  const allFuture = [];
+  GROUPS.forEach(g => g.matches.forEach((m, i) => {
+    if (m.d === todayStr) return;
+    let matchDate;
+    if (m.utc) {
+      matchDate = new Date(m.utc);
+    } else {
       const parts = m.d.split(' ');
       const day = parseInt(parts[0]);
       const month = MONTHS_FR[parts[1]] ?? 5;
       const [h, min] = m.t.split(':').map(Number);
-      const matchDate = new Date(2026, month, day, h, min);
-      if (matchDate > now) allFuture.push({ g, m, i, matchDate });
-    }));
-    allFuture.sort((a, b) => a.matchDate - b.matchDate);
-    const nextDate = allFuture[0]?.m.d || '';
-    const nextMatches = allFuture.filter(x => x.m.d === nextDate);
+      matchDate = new Date(2026, month, day, h, min);
+    }
+    if (matchDate > now) allFuture.push({ g, m, i, matchDate });
+  }));
+  allFuture.sort((a, b) => a.matchDate - b.matchDate);
+  const nextDate = allFuture[0]?.m.d || '';
+  const nextMatches = allFuture.filter(x => x.m.d === nextDate);
 
-    container.innerHTML = `
-      <div class="live-hero">
-        <div class="live-hero-icon">📅</div>
-        <div class="live-hero-title">Pas de match aujourd'hui</div>
-        <div class="live-hero-sub">Prochain match : <strong>${nextDate || '—'}</strong></div>
-      </div>
-      ${nextMatches.length ? `
-        <div class="live-section-label">Prochain jour de match</div>
-        <div class="live-cards">${nextMatches.map(x => renderLiveCard(x.g, x.m, x.i)).join('')}</div>
-      ` : ''}`;
-    return;
+  // ── Onglets Hier / Aujourd'hui / À venir ──
+  const MONTHS_ARR = ['Janvier','Février','Mars','Avril','Mai','Juin','Juillet','Août','Septembre','Octobre','Novembre','Décembre'];
+  const yd = new Date(now.getTime() - 86400000);
+  const yStr = `${yd.getDate()} ${MONTHS_ARR[yd.getMonth()]}`;
+  const yesterdayMatches = [];
+  GROUPS.forEach(g => g.matches.forEach((m, i) => { if (m.d === yStr) yesterdayMatches.push({ g, m, i }); }));
+
+  const tab = window._liveTab || 'today';
+  const tabsHtml = `
+    <div class="live-day-tabs">
+      <button class="live-day-tab ${tab === 'yesterday' ? 'active' : ''}" onclick="setLiveTab('yesterday')">Hier</button>
+      <button class="live-day-tab ${tab === 'today' ? 'active' : ''}" onclick="setLiveTab('today')">Aujourd'hui</button>
+      <button class="live-day-tab ${tab === 'future' ? 'active' : ''}" onclick="setLiveTab('future')">À venir</button>
+    </div>`;
+
+  const liveCount = todayMatches.filter(x => matchLiveStatus(x.m) === 'live').length;
+  const isMobile = window.matchMedia('(max-width: 768px)').matches;
+  // Mobile : cartes épurées (mêmes que l'onglet Matchs), section = label + liste
+  const card = isMobile ? renderMatchRowMobile : renderLiveCard;
+  const list = (items) => isMobile
+    ? `<div class="mr-list">${items.map(x => card(x.g, x.m, x.i)).join('')}</div>`
+    : `<div class="live-cards">${items.map(x => card(x.g, x.m, x.i)).join('')}</div>`;
+  const label = (txt, cls = '') => `<div class="live-section-label ${cls}">${txt}</div>`;
+  const empty = (ico, title, sub = '') =>
+    `<div class="live-hero"><div class="live-hero-icon">${ico}</div><div class="live-hero-title">${title}</div>${sub ? `<div class="live-hero-sub">${sub}</div>` : ''}</div>`;
+
+  let body = '';
+  if (tab === 'yesterday') {
+    body = yesterdayMatches.length
+      ? label(`${yStr}`) + list(yesterdayMatches)
+      : empty('📅', 'Pas de match hier');
+  } else if (tab === 'future') {
+    const dates = [...new Set(allFuture.map(x => x.m.d))].slice(0, 3);
+    body = dates.length
+      ? dates.map(d => label(`${d}`) + list(allFuture.filter(x => x.m.d === d))).join('')
+      : empty('🏁', 'Plus de match à venir');
+  } else {
+    const liveNow    = todayMatches.filter(x => matchLiveStatus(x.m) === 'live');
+    const upcoming   = todayMatches.filter(x => matchLiveStatus(x.m) === 'upcoming');
+    const finished   = todayMatches.filter(x => matchLiveStatus(x.m) === 'finished');
+    body = todayMatches.length ? `
+      ${liveNow.length  ? label('En direct', 'live-label-red') + list(liveNow) : ''}
+      ${upcoming.length ? label("À venir aujourd'hui") + list(upcoming) : ''}
+      ${finished.length ? label('Terminés') + list(finished) : ''}`
+      : empty('📅', "Pas de match aujourd'hui", `Prochain match : <strong>${nextDate || '—'}</strong>`);
   }
-
-  const liveNow    = todayMatches.filter(x => matchLiveStatus(x.m) === 'live');
-  const upcoming   = todayMatches.filter(x => matchLiveStatus(x.m) === 'upcoming');
-  const finished   = todayMatches.filter(x => matchLiveStatus(x.m) === 'finished');
 
   container.innerHTML = `
     <div class="live-page-header">
       <div class="live-page-date">${todayStr} 2026</div>
-      <div class="live-page-badge"><span class="mc-live-dot"></span>${liveNow.length} EN DIRECT</div>
+      <div class="live-page-badge"><span class="mc-live-dot"></span>${liveCount} EN DIRECT</div>
     </div>
-    ${liveNow.length ? `<div class="live-section-label live-label-red">🔴 En direct</div>
-      <div class="live-cards">${liveNow.map(x => renderLiveCard(x.g, x.m, x.i)).join('')}</div>` : ''}
-    ${upcoming.length ? `<div class="live-section-label">🕐 À venir</div>
-      <div class="live-cards">${upcoming.map(x => renderLiveCard(x.g, x.m, x.i)).join('')}</div>` : ''}
-    ${finished.length ? `<div class="live-section-label">✅ Terminés</div>
-      <div class="live-cards live-cards-finished">${finished.map(x => renderLiveCard(x.g, x.m, x.i)).join('')}</div>` : ''}`;
+    ${tabsHtml}
+    ${body}`;
+}
+
+function setLiveTab(t) { window._liveTab = t; renderLiveView(); }
+function calSelectDate(d) {
+  window._calDate = d;
+  renderCalendar();
 }
 
 function pseudoHue(p) {
@@ -3901,8 +4427,16 @@ function renderLiveCard(g, m, i) {
   const hAnim = animActive && meta.lastTeam === 'home' ? 'mc-goal-anim' : '';
   const aAnim = animActive && meta.lastTeam === 'away' ? 'mc-goal-anim' : '';
 
-  const hScorers = scorers.home.length ? `<div class="lc-scorers">${scorers.home.join(' · ')}</div>` : '';
-  const aScorers = scorers.away.length ? `<div class="lc-scorers">${scorers.away.join(' · ')}</div>` : '';
+  const det = state.matchDetails[scoreKey] || {};
+  // une ligne par événement : icône + minute + nom (même lisibilité que le résumé)
+  const sideEvents = (side) => [
+    ...(scorers[side] || []).map(n => `<div class="lc-ev">⚽ ${n}</div>`),
+    ...(det.yellows?.[side] || []).map(n => `<div class="lc-ev">🟨 ${n}</div>`),
+    ...(det.reds?.[side] || []).map(n => `<div class="lc-ev">🟥 ${n}</div>`),
+  ].join('');
+  const hScorers = sideEvents('home');
+  const aScorers = sideEvents('away');
+  const liveClock = (state.liveInfo[scoreKey]?.clock || '').trim();
 
   // Admin check
   const currentPseudo = localStorage.getItem('wc2026_pseudo') || '';
@@ -3937,9 +4471,12 @@ function renderLiveCard(g, m, i) {
   try {
     const allUsers = JSON.parse(localStorage.getItem('wc2026_users') || '{}');
     const realStore = JSON.parse(localStorage.getItem('wc2026_real') || '{}');
-    const pseudos = Object.keys(allUsers).filter(u => u !== '_admin_');
+    const pseudos = Object.keys(allUsers).filter(u => u !== '_admin_' && !(typeof isRemovedPseudo === 'function' && isRemovedPseudo(u)));
     if (pseudos.length > 0) {
       const MAX_VISIBLE = 5;
+      // Points seulement si le match est VRAIMENT terminé (pas en cours).
+      // _effectiveReal exclut les matchs 'in' → pas de points prématurés.
+      const effReal = (typeof _effectiveReal === 'function') ? _effectiveReal()[scoreKey] : null;
       const allCards = pseudos.map(pseudo => {
         const prono = allUsers[pseudo]?.pronostics?.[scoreKey] || allUsers[pseudo]?.pronos?.[scoreKey];
         if (!prono) return null;
@@ -3947,17 +4484,10 @@ function renderLiveCard(g, m, i) {
         let cardClass = 'prono-card-pending';
         let ptsBadge = `<span class="pcard-pts pending">?</span>`;
         let glowStyle = '';
-        if (score && typeof scorePoints === 'function') {
-          const realEntry = realStore[scoreKey] || {};
-          const real = {
-            score,
-            scorers: state.scorers[scoreKey] || { home: [], away: [] },
-            penalty: realEntry.penalty,
-            redCards: realEntry.redCards
-          };
-          const result = scorePoints(prono, real);
+        if (effReal && typeof scorePoints === 'function') {
+          const result = scorePoints(prono, effReal);
           const total = result.total;
-          const isExact = prono.score && prono.score === score;
+          const isExact = prono.score && prono.score === effReal.score;
           if (isExact) {
             cardClass = 'prono-card-exact';
             glowStyle = `box-shadow:0 0 0 1.5px hsl(45,100%,60%),0 4px 20px hsl(45,100%,40%,0.35)`;
@@ -3981,7 +4511,7 @@ function renderLiveCard(g, m, i) {
         const visible = allCards.slice(0, MAX_VISIBLE);
         const overflow = allCards.length - MAX_VISIBLE;
         const cardsHtml = allCards.map((c, idx) => `
-          <div class="prono-card ${c.cardClass}" style="${c.glowStyle};animation-delay:${idx * 60}ms;cursor:pointer" onclick="event.stopPropagation();openPseudoPronos('${c.pseudo.replace(/'/g,"\\'")}')">
+          <div class="prono-card ${c.cardClass}" style="${c.glowStyle};animation-delay:${idx * 60}ms;cursor:pointer" onclick="event.stopPropagation();openPronoDetail('${c.pseudo.replace(/'/g,"\\'")}','${scoreKey}')">
             ${c.avatarHtml}
             <div class="pcard-predicted">${c.pScore}</div>
             <div class="pcard-pseudo">${c.pseudo}</div>
@@ -3999,8 +4529,8 @@ function renderLiveCard(g, m, i) {
   } catch(e) {}
 
   return `
-  <div class="live-card ${isLive ? 'lc-live' : ''} ${score ? 'lc-has-score' : ''}" onclick="openMatchPitchPanel('${g.id}',${i})">
-    ${isLive ? `<div class="lc-live-badge"><span class="mc-live-dot"></span>LIVE</div>` : `<div class="lc-time">${m.t}</div>`}
+  <div class="live-card ${isLive ? 'lc-live' : ''} ${score ? 'lc-has-score' : ''}" onclick="gpMatchClick('${g.id}',${i})">
+    ${isLive ? `<div class="lc-live-badge"><span class="mc-live-dot"></span>LIVE${liveClock ? ` · ${liveClock}` : ''}</div>` : `<div class="lc-datetime"><span class="lc-dt-date">${m.d}</span><span class="lc-dt-time">${m.t}</span></div>`}
     <div class="lc-body">
       <div class="lc-team">
         <span class="lc-flag">${hTeam?.flag || ''}</span>
@@ -4289,7 +4819,22 @@ function spsOpenPlayer(teamName, playerId) {
   const p = td.players.find(pl => pl.id === playerId);
   if (!p) return;
   td.name = teamName;
-  document.getElementById('sps-player-detail').innerHTML = `<div style="padding:16px;display:flex;flex-direction:column;gap:12px">${_buildPlayerBlocks(p, td, playerId)}</div>`;
+  const det = document.getElementById('sps-player-detail');
+  det.innerHTML = `<div style="padding:16px;display:flex;flex-direction:column;gap:12px">${_buildPlayerBlocks(p, td, playerId)}</div>`;
+  // Mobile : ferme le clavier et descend sur la fiche (sinon elle semble "vide")
+  if (window.matchMedia('(max-width: 768px)').matches) {
+    document.getElementById('sps-input')?.blur();
+    setTimeout(() => {
+      const sc = document.scrollingElement || document.documentElement;
+      const target = sc.scrollTop + det.getBoundingClientRect().top - 70;
+      const start = sc.scrollTop, dist = target - start, t0 = Date.now();
+      const iv = setInterval(() => {
+        const pr = Math.min((Date.now() - t0) / 350, 1);
+        sc.scrollTop = start + dist * (1 - Math.pow(1 - pr, 3));
+        if (pr >= 1) clearInterval(iv);
+      }, 16);
+    }, 80);
+  }
 }
 
 // ── Player Compare ────────────────────────────────────────────────────────────
@@ -4400,15 +4945,24 @@ function renderStats() {
 
   const medals = ['🥇','🥈','🥉'];
 
-  // ── WC 2026 live scorers ──
+  // ── WC 2026 live scorers (noms nettoyés de la minute, équipe associée) ──
   const wc2026GoalMap = {};
-  Object.values(state.scorers || {}).forEach(({ home = [], away = [] }) => {
-    [...home, ...away].forEach(n => {
-      const name = (n || '').trim();
-      if (name) wc2026GoalMap[name] = (wc2026GoalMap[name] || 0) + 1;
-    });
+  Object.entries(state.scorers || {}).forEach(([key, { home = [], away = [] }]) => {
+    const kp = key.split('_');
+    const grp = GROUPS.find(g => g.id === kp[0]);
+    const match = grp?.matches[parseInt(kp[1])];
+    const add = (n, teamName) => {
+      const name = (n || '').replace(/^\d+'(?:\+\d+')?\s*/, '').replace(/\s*\((pen|csc)\)$/, '').trim();
+      if (!name) return;
+      if (!wc2026GoalMap[name]) wc2026GoalMap[name] = { goals: 0, team: teamName || '' };
+      wc2026GoalMap[name].goals++;
+    };
+    home.forEach(n => add(n, match?.h));
+    away.forEach(n => add(n, match?.a));
   });
-  const wc2026Entries = Object.entries(wc2026GoalMap).sort((a, b) => b[1] - a[1]);
+  const wc2026Entries = Object.entries(wc2026GoalMap)
+    .map(([name, v]) => [name, v.goals, v.team])
+    .sort((a, b) => b[1] - a[1]);
 
   function findPlayerInfo(name) {
     const lower = name.toLowerCase();
@@ -4431,21 +4985,34 @@ function renderStats() {
 
   const wc2026ScorersHtml = wc2026Entries.length === 0
     ? emptyLive('⚽', 'Aucun buteur enregistré', 'Les stats se mettront à jour au fil des matchs · Saisie via l\'onglet Calendrier')
-    : wc2026Entries.map(([name, goals], i) => {
+    : wc2026Entries.map(([name, goals, teamName], i) => {
         const { flag, photo } = findPlayerInfo(name);
+        const teamFlag = flag || GROUPS.flatMap(g => g.teams).find(t => t.name === teamName)?.flag || '⚽';
         return `<div class="wch-scorer-row" style="--delay:${i * 40}ms">
           <div class="wch-sc-rank">${medals[i] || (i + 1)}</div>
-          <div class="wch-sc-flag">${flag || '⚽'}</div>
+          <div class="wch-sc-flag">${teamFlag}</div>
           ${photo ? `<img class="wch-sc-photo" src="${photo}" onerror="this.style.display='none'">` : ''}
-          <div class="wch-sc-info"><div class="wch-sc-name">${name}</div></div>
+          <div class="wch-sc-info">
+            <div class="wch-sc-name">${name}</div>
+            ${teamName ? `<div class="wch-sc-team">${teamName}</div>` : ''}
+          </div>
           <div class="wch-sc-goals wch-goals-live">${goals} ⚽</div>
         </div>`;
       }).join('');
 
-  // ── WC 2026 buts par équipe (from state.scores) ──
+  // ── WC 2026 buts par équipe (state.scores = "2-0") ──
+  const _parseSc = (sc) => {
+    if (typeof sc === 'string' && sc.includes('-')) {
+      const [h, a] = sc.split('-').map(x => parseInt(x.trim()));
+      if (!isNaN(h) && !isNaN(a)) return { home: h, away: a };
+    }
+    if (sc && sc.home !== undefined) return sc;
+    return null;
+  };
   const wc2026TeamGoals = {};
-  Object.entries(state.scores || {}).forEach(([scoreKey, sc]) => {
-    if (!sc || sc.home === undefined) return;
+  Object.entries(state.scores || {}).forEach(([scoreKey, raw]) => {
+    const sc = _parseSc(raw);
+    if (!sc) return;
     const parts = scoreKey.split('_');
     if (parts.length < 2) return;
     const grp = GROUPS.find(g => g.id === parts[0]);
@@ -4458,10 +5025,11 @@ function renderStats() {
   const teamGoalEntries = Object.entries(wc2026TeamGoals).sort((a, b) => b[1] - a[1]).filter(([, g]) => g > 0);
   const maxTeamGoals = teamGoalEntries[0]?.[1] || 1;
 
-  // ── WC 2026 cleansheets (from state.scores) ──
+  // ── WC 2026 cleansheets (state.scores = "2-0") ──
   const wc2026CS = {};
-  Object.entries(state.scores || {}).forEach(([scoreKey, sc]) => {
-    if (!sc || sc.home === undefined) return;
+  Object.entries(state.scores || {}).forEach(([scoreKey, raw]) => {
+    const sc = _parseSc(raw);
+    if (!sc) return;
     const parts = scoreKey.split('_');
     if (parts.length < 2) return;
     const grp = GROUPS.find(g => g.id === parts[0]);
@@ -4612,7 +5180,7 @@ function renderStats() {
         onclick="switchStatsTab('scorers-wc2026', this)">⚽ WC 2026</button>
       <button class="wch-tab"
         onmouseenter="switchStatsTab('hist-scorers', this)"
-        onclick="switchStatsTab('hist-scorers', this)">🏅 Buteurs Hist.</button>
+        onclick="switchStatsTab('hist-scorers', this)">Buteurs Hist.</button>
       <button class="wch-tab"
         onmouseenter="switchStatsTab('hist-passeurs', this)"
         onclick="switchStatsTab('hist-passeurs', this)">🎯 Passeurs Hist.</button>
@@ -4632,13 +5200,13 @@ function renderStats() {
       <div class="wch-subtabs">
         <button class="wch-stab active"
           onmouseenter="switchSubStatsTab('wc2026-scorers', this)"
-          onclick="switchSubStatsTab('wc2026-scorers', this)">⚽ Buteurs 2026</button>
+          onclick="switchSubStatsTab('wc2026-scorers', this)">Buteurs 2026</button>
         <button class="wch-stab"
           onmouseenter="switchSubStatsTab('wc2026-teams', this)"
-          onclick="switchSubStatsTab('wc2026-teams', this)">📊 Buts/équipe</button>
+          onclick="switchSubStatsTab('wc2026-teams', this)">Buts/équipe</button>
         <button class="wch-stab"
           onmouseenter="switchSubStatsTab('wc2026-cs', this)"
-          onclick="switchSubStatsTab('wc2026-cs', this)">🧤 Cleansheets</button>
+          onclick="switchSubStatsTab('wc2026-cs', this)">Cleansheets</button>
       </div>
 
       <div id="stats-wc2026-scorers" class="stats-table-wrap">
@@ -5299,6 +5867,56 @@ function renderCustomSquad() {
 
     const count = customStartersIds.length;
 
+    // ── MOBILE : vue simple — sélecteur pays, fiche équipe + terrain titulaires ──
+    if (window.matchMedia('(max-width: 768px)').matches) {
+        const teamNamesM = Object.keys(TEAMS).sort();
+        const selectOptsM = teamNamesM.map(n => `<option value="${n}" ${n === teamName ? 'selected' : ''}>${TEAMS[n].flag} ${n}</option>`).join('');
+        const posOrderM = { 'Gardien': 0, 'Défenseur': 1, 'Milieu': 2, 'Attaquant': 3 };
+        const startersM = [...officialStarters].sort((a, b) => (posOrderM[a.pos] || 0) - (posOrderM[b.pos] || 0));
+        container.innerHTML = `
+        <div class="cs-mobile">
+          <div class="cs-m-picker">
+            <span class="cs-picker-flag">${td.flag || ''}</span>
+            <select class="cs-m-select" onchange="changeCustomTeam(this.value)">${selectOptsM}</select>
+          </div>
+          <div class="cs-m-duo">
+            <div class="cs-m-card">
+              ${TEAM_BANNER_MAP[teamName]
+                ? `<img src="${TEAM_BANNER_MAP[teamName]}" alt="${teamName}" onerror="this.style.display='none'">`
+                : `<div class="cs-img-fallback">${td.flag}</div>`}
+              <div class="cs-m-card-name">${td.flag} ${teamName}</div>
+            </div>
+            <div class="cs-m-pitch">
+              <div class="football-pitch">
+                ${renderPitchLines()}
+                <div class="pitch-players">${(() => {
+                  // terrain complet : une ligne par poste, répartie sur la hauteur
+                  const lines = [['Attaquant', 16], ['Milieu', 42], ['Défenseur', 68], ['Gardien', 90]];
+                  return lines.map(([pos, y]) => {
+                    const ps = startersM.filter(p => (p.pos || '').startsWith(pos));
+                    return ps.map((p, i) => `
+                      <div class="pitch-player" style="left:${Math.round((i + 1) / (ps.length + 1) * 100)}%;top:${y}%">
+                        <div class="mpp-pitch-circle" style="background:${teamColor}">${p.n || ''}</div>
+                        <div class="pitch-player-label" style="font-size:0.52rem">${(p.name || '').split(' ').pop().toUpperCase().slice(0, 9)}</div>
+                      </div>`).join('');
+                  }).join('');
+                })()}</div>
+              </div>
+            </div>
+          </div>
+          <div class="cs-m-list">
+            <div class="cs-m-list-title">XI titulaire · ${td.coach ? 'Sél. ' + td.coach : ''} ${td.formation ? '· ' + td.formation : ''}</div>
+            ${startersM.map(p => `
+              <div class="cs-m-row" onclick="openTeamPanel('${teamName.replace(/'/g, "\\'")}')">
+                <span class="cs-m-num" style="background:${teamColor}">${p.n || '—'}</span>
+                <span class="cs-m-name">${cleanPlayerName(p.name)}</span>
+                <span class="cs-m-pos"><span class="pos-badge ${posClass(p.pos)}">${posShort(p.pos)}</span></span>
+              </div>`).join('')}
+          </div>
+        </div>`;
+        return;
+    }
+
     // Pool grouped by position
     const posGroups = { 'Gardien':[], 'Défenseur':[], 'Milieu':[], 'Attaquant':[] };
     td.players.forEach(p => {
@@ -5887,6 +6505,12 @@ function _openPlayerStatsFull(teamName, playerId) {
   openPanel(html, `<button class="pp-back" onclick="openTeamPanel('${tn}')">← ${teamName}</button>${name}`);
 }
 
+function bkGoto(id) {
+  const scroller = document.getElementById('bk-scroll');
+  const col = scroller?.querySelector(`[data-bk="${id}"]`);
+  if (col) scroller.scrollTo({ left: Math.max(col.offsetLeft - 14, 0), behavior: 'smooth' });
+}
+
 function koSwitchTab(btn, phaseId) {
   const wrap = btn.closest('.ko-wrap');
   wrap.querySelectorAll('.ko-tab').forEach(b => b.classList.remove('active'));
@@ -5939,7 +6563,26 @@ function renderKnockout() {
       ${renderKOTeam(t2, lb)}
     </div>`;
 
+  // Panneau "Groupes" (style FIFA) : mini-classements des 12 groupes
+  const groupsPanelHtml = `<div class="ko-grp-grid">${GROUPS.map(g => {
+    const st = getGroupStandings(g.id);
+    return `
+      <div class="ko-grp-card" onclick="openGroupPanel('${g.id}')">
+        <div class="ko-grp-head"><span>Groupe ${g.id}</span><span>PTS</span></div>
+        ${st.map((t, i) => {
+          const code = g.teams.find(tt => tt.name === t.name)?.code || t.name;
+          return `<div class="ko-grp-row ${i < 2 ? 'q' : ''}">
+            <span class="ko-grp-rank">${i + 1}</span>
+            <span class="ko-grp-flag">${t.flag}</span>
+            <span class="ko-grp-name">${code}</span>
+            <span class="ko-grp-pts">${t.pts}</span>
+          </div>`;
+        }).join('')}
+      </div>`;
+  }).join('')}</div>`;
+
   const phases = [
+    { id: 'pg',   label: 'Groupes',      icon: '▤', cls: 'ko-pg',   cols: 0, matches: [] },
     { id: 'r32a', label: '32èmes (1/2)', icon: '⚡', cls: 'ko-r32',  cols: 4, matches: m32.slice(0, 8) },
     { id: 'r32b', label: '32èmes (2/2)', icon: '⚡', cls: 'ko-r32b', cols: 4, matches: m32.slice(8) },
     { id: 'r16',  label: '16èmes',       icon: '🔥', cls: 'ko-r16',  cols: 4, matches: [
@@ -5967,6 +6610,77 @@ function renderKnockout() {
     ]},
   ];
 
+  // ── MOBILE : bracket continu style FIFA (colonnes + connecteurs, pan horizontal) ──
+  if (window.matchMedia('(max-width: 768px)').matches) {
+    const bkTeam = (t, label) => `
+      <div class="bk-team ${t ? '' : 'bk-tbd'}">
+        ${t ? `<span class="bk-flag">${t.flag}</span><b>${t.code || t.name}</b>` : `<span class="bk-lbl">${label}</span>`}
+      </div>`;
+    const bkMatch = (m) => `<div class="bk-match">${bkTeam(m.a, m.la)}${bkTeam(m.b, m.lb)}</div>`;
+    const bkPairs = (ms) => {
+      const out = [];
+      for (let j = 0; j < ms.length; j += 2) {
+        out.push(`<div class="bk-pair">${bkMatch(ms[j])}${ms[j + 1] ? bkMatch(ms[j + 1]) : ''}</div>`);
+      }
+      return out.join('');
+    };
+
+    const r16m = phases.find(p => p.id === 'r16').matches;
+    const qfm  = phases.find(p => p.id === 'qf').matches;
+    const sfm  = phases.find(p => p.id === 'sf').matches;
+    const fm   = phases.find(p => p.id === 'final').matches;
+
+    const colGroups = `<div class="bk-col bk-col-groups" data-bk="pg">${GROUPS.map(g => {
+      const st = getGroupStandings(g.id);
+      return `<div class="ko-grp-card" onclick="openGroupPanel('${g.id}')">
+        <div class="ko-grp-head"><span>Groupe ${g.id}</span><span>PTS</span></div>
+        ${st.map((t, idx) => {
+          const code = g.teams.find(tt => tt.name === t.name)?.code || t.name;
+          return `<div class="ko-grp-row ${idx < 2 ? 'q' : ''}">
+            <span class="ko-grp-rank">${idx + 1}</span>
+            <span class="ko-grp-flag">${t.flag}</span>
+            <span class="ko-grp-name">${code}</span>
+            <span class="ko-grp-pts">${t.pts}</span>
+          </div>`;
+        }).join('')}
+      </div>`;
+    }).join('')}</div>`;
+
+    const stages = [['pg','PG'], ['r32','32es'], ['r16','16es'], ['qf','QF'], ['sf','DF'], ['f','F']];
+    const bkTabs = `<div class="ko-tabs bk-tabs">${stages.map(([id, l], i) =>
+      `<button class="ko-tab ${i === 0 ? 'active' : ''}" data-bk-tab="${id}" onclick="bkGoto('${id}')">${l}</button>`).join('')}</div>`;
+
+    container.innerHTML = `
+      <div class="ko-wrap bk-wrap">
+        ${bkTabs}
+        <div class="bk-scroll" id="bk-scroll">
+          <div class="bk-scene">
+            ${colGroups}
+            <div class="bk-col" data-bk="r32">${bkPairs(m32)}</div>
+            <div class="bk-col" data-bk="r16">${bkPairs(r16m)}</div>
+            <div class="bk-col" data-bk="qf">${bkPairs(qfm)}</div>
+            <div class="bk-col" data-bk="sf">${bkPairs(sfm)}</div>
+            <div class="bk-col bk-col-final" data-bk="f">${bkMatch(fm[0])}</div>
+          </div>
+        </div>
+      </div>`;
+
+    // tab actif suit le scroll
+    const scroller = document.getElementById('bk-scroll');
+    scroller.addEventListener('scroll', () => {
+      clearTimeout(scroller._t);
+      scroller._t = setTimeout(() => {
+        const cols = [...scroller.querySelectorAll('[data-bk]')];
+        const sl = scroller.scrollLeft + 50;
+        let cur = cols[0];
+        cols.forEach(c => { if (c.offsetLeft <= sl) cur = c; });
+        document.querySelectorAll('.bk-tabs .ko-tab').forEach(t =>
+          t.classList.toggle('active', t.dataset.bkTab === cur.dataset.bk));
+      }, 80);
+    }, { passive: true });
+    return;
+  }
+
   const tabsHtml = phases.map((ph, i) => `
     <button class="ko-tab ${i === 0 ? 'active' : ''}" onclick="koSwitchTab(this, '${ph.id}')"
       data-phase="${ph.id}">
@@ -5975,9 +6689,10 @@ function renderKnockout() {
 
   const panelsHtml = phases.map((ph, i) => `
     <div class="ko-panel ${i === 0 ? 'active' : ''}" data-phase="${ph.id}">
+      ${ph.id === 'pg' ? groupsPanelHtml : `
       <div class="ko-phase-grid ko-cols-${ph.cols}">
         ${ph.matches.map(m => renderKOMatch(m.a, m.la, m.b, m.lb, ph.cls)).join('')}
-      </div>
+      </div>`}
     </div>`).join('');
 
   container.innerHTML = `
@@ -5985,4 +6700,23 @@ function renderKnockout() {
       <div class="ko-tabs">${tabsHtml}</div>
       <div class="ko-panels">${panelsHtml}</div>
     </div>`;
+
+  // Mobile : swipe gauche/droite → étape précédente/suivante
+  const koWrap = container.querySelector('.ko-wrap');
+  if (koWrap && window.matchMedia('(max-width: 768px)').matches) {
+    let _kx = 0, _ky = 0;
+    koWrap.addEventListener('touchstart', e => { _kx = e.touches[0].clientX; _ky = e.touches[0].clientY; }, { passive: true });
+    koWrap.addEventListener('touchend', e => {
+      const dx = e.changedTouches[0].clientX - _kx;
+      const dy = e.changedTouches[0].clientY - _ky;
+      if (Math.abs(dx) < 70 || Math.abs(dy) > 60) return;
+      const tabs = [...koWrap.querySelectorAll('.ko-tab')];
+      const cur = tabs.findIndex(t => t.classList.contains('active'));
+      const nxt = dx < 0 ? cur + 1 : cur - 1;
+      if (nxt >= 0 && nxt < tabs.length) {
+        tabs[nxt].click();
+        tabs[nxt].scrollIntoView({ inline: 'center', block: 'nearest', behavior: 'smooth' });
+      }
+    }, { passive: true });
+  }
 }

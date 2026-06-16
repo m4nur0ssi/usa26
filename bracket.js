@@ -68,7 +68,7 @@ function renderPronostics() {
   }
   c.innerHTML = `
     <div class="prono-hub-head">
-      <h1 class="prono-hub-title">🎯 Pronostics</h1>
+      <h1 class="prono-hub-title">Pronostics</h1>
       <p class="prono-hub-sub">Choisis ton mode de prédiction</p>
     </div>
     <div class="prono-hub-tabs">
@@ -98,8 +98,36 @@ function setPronoTab(tab) {
 function _renderPronoTabBody() {
   const body = document.getElementById('prono-tab-body');
   if (!body) return;
-  if (_pronoTab === 'matchs') body.innerHTML = _renderPronoMatches();
-  else body.innerHTML = _renderBracketPredictor();
+  if (_pronoTab === 'matchs') {
+    body.innerHTML = _renderPronoMatches();
+    _scrollToCurrentPronoMatch();
+  } else {
+    body.innerHTML = _renderBracketPredictor();
+  }
+}
+
+// Amène automatiquement sur le pronostic du match en cours (sinon le prochain à jouer)
+function _scrollToCurrentPronoMatch() {
+  let liveKey = null, nextKey = null, nextTime = Infinity;
+  const now = Date.now();
+  GROUPS.forEach(g => g.matches.forEach((m, i) => {
+    const key = g.id + '_' + i;
+    const st = (typeof matchLiveStatus === 'function') ? matchLiveStatus(m) : 'upcoming';
+    if (st === 'live' && !liveKey) liveKey = key;
+    if (st === 'upcoming') {
+      const t = m.utc ? new Date(m.utc).getTime() : Infinity;
+      if (t < nextTime) { nextTime = t; nextKey = key; }
+    }
+  }));
+  const target = liveKey || nextKey;
+  if (!target) return;
+  setTimeout(() => {
+    const el = document.getElementById('pmx-' + target);
+    if (!el) return;
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    el.classList.add('pmx-focus');
+    setTimeout(() => el.classList.remove('pmx-focus'), 2200);
+  }, 120);
 }
 
 // ── MATCH PRONO — storage helpers (shared wc2026_users store) ───────────
@@ -142,41 +170,95 @@ function _colorScore(real, hc, ac) {
   return real;
 }
 
-// ── MATCH PRONO LIST (redesigned: inline 1·N·2) ─────────────────────────
+// ── MATCH PRONO LIST (classé par date de match, pas par groupe) ─────────
+// Tous les matchs aplatis et triés chronologiquement.
+function _pronoMatchesSorted() {
+  const arr = [];
+  GROUPS.forEach(g => g.matches.forEach((m, i) => {
+    const key = g.id + '_' + i;
+    const t = m.utc ? new Date(m.utc).getTime() : Infinity;
+    arr.push({ g, m, i, key, t });
+  }));
+  arr.sort((a, b) => a.t - b.t);
+  return arr;
+}
+
+// Prochain match à pronostiquer après `currentKey` (à venir, sans prono).
+function _nextPronoKey(currentKey) {
+  const list = _pronoMatchesSorted();
+  const idx = list.findIndex(x => x.key === currentKey);
+  for (let j = idx + 1; j < list.length; j++) {
+    const { m, key } = list[j];
+    const real = (typeof state !== 'undefined' && state.scores[key]) || m.s || '';
+    if (real) continue;                       // déjà joué
+    const pr = _pmGet(key);
+    if (pr && (pr.score || pr.outcome)) continue; // déjà pronostiqué
+    return key;
+  }
+  return null;
+}
+
 function _renderPronoMatches() {
-  return `<div class="pmx-wrap">` + GROUPS.map(g => `
-    <div class="pmx-group">
-      <div class="pmx-group-hd">Groupe ${g.id}</div>
-      ${g.matches.map((m, i) => {
-        const key = g.id + '_' + i;
-        const real = (typeof state !== 'undefined' && state.scores[key]) || m.s || '';
-        const pr = _pmGet(key);
-        const oc = _ocOf(pr);
-        const hInfo = g.teams.find(t => t.name === m.h);
-        const aInfo = g.teams.find(t => t.name === m.a);
-        const played = !!real;
-        const dis = played ? 'disabled' : '';
-        const on = v => oc === v ? 'on' : '';
-        const hc = _teamCol(m.h), ac = _teamCol(m.a);
-        const detail = pr.score || (pr.homeScorers && pr.homeScorers.length) || (pr.awayScorers && pr.awayScorers.length) || pr.penalty || pr.redCards || pr.yellowCards;
-        const detailLabel = pr.score ? `Score ${pr.score} · Buteurs · Cartons · Penalty` : '⚽ Buteurs · 🟨🟥 Cartons · 🥅 Penalty';
-        return `<div class="pmx-card ${played ? 'pmx-played' : ''}" id="pmx-${key}">
-          <div class="pmx-top">
-            <div class="pmx-team"><span class="pmx-fl">${hInfo?.flag || ''}</span><span class="pmx-nm">${m.h}</span></div>
-            <div class="pmx-cen">${played ? `<span class="pmx-score">${_colorScore(real, hc, ac)}</span>` : `<span class="pmx-vs">VS</span>`}<span class="pmx-date">${m.d || ''}</span></div>
-            <div class="pmx-team pmx-team-r"><span class="pmx-nm">${m.a}</span><span class="pmx-fl">${aInfo?.flag || ''}</span></div>
-          </div>
-          <div class="pmx-bet">
-            <button class="pmx-bx ${on('1')}" ${dis} onclick="pmSetOutcome('${key}','1',this)"><b>1</b><small>${m.h}</small></button>
-            <button class="pmx-bx pmx-bx-n ${on('N')}" ${dis} onclick="pmSetOutcome('${key}','N',this)"><b>N</b><small>Nul</small></button>
-            <button class="pmx-bx ${on('2')}" ${dis} onclick="pmSetOutcome('${key}','2',this)"><b>2</b><small>${m.a}</small></button>
-          </div>
-          <button class="pmx-more ${detail ? 'pmx-more-set' : ''}" onclick="openMatchPronoPanel('${g.id}',${i})">
-            <span>${detailLabel}</span>${detail ? '<span class="pmx-dot"></span>' : '<span class="pmx-chev">›</span>'}
-          </button>
-        </div>`;
-      }).join('')}
-    </div>`).join('') + `</div>`;
+  const list = _pronoMatchesSorted();
+  let html = `<div class="pmx-wrap">`;
+  let curDate = null;
+  list.forEach(({ g, m, i, key }) => {
+    if (m.d !== curDate) {
+      if (curDate !== null) html += `</div>`;
+      curDate = m.d;
+      html += `<div class="pmx-group"><div class="pmx-group-hd">${m.d || ''}</div>`;
+    }
+    html += _renderPronoCard(g, m, i, key);
+  });
+  if (curDate !== null) html += `</div>`;
+  return html + `</div>`;
+}
+
+function _renderPronoCard(g, m, i, key) {
+  const real = (typeof state !== 'undefined' && state.scores[key]) || m.s || '';
+  const pr = _pmGet(key);
+  const oc = _ocOf(pr);
+  const hInfo = g.teams.find(t => t.name === m.h);
+  const aInfo = g.teams.find(t => t.name === m.a);
+  const played = !!real;
+  const dis = played ? 'disabled' : '';
+  const on = v => oc === v ? 'on' : '';
+  const hc = _teamCol(m.h), ac = _teamCol(m.a);
+  const hasProno = !!(oc || pr.score);
+  // Un score live 0-0 sans pronostic prête à confusion → score vide.
+  const emptyScore = played && String(real).replace(/\s/g, '') === '0-0' && !hasProno;
+  const detail = pr.score || (pr.homeScorers && pr.homeScorers.length) || (pr.awayScorers && pr.awayScorers.length) || pr.penalty || pr.redCards || pr.yellowCards;
+
+  // Libellé du bouton bas selon l'état du match.
+  let detailLabel;
+  if (played) {
+    // Match joué → on affiche le pronostic de l'utilisateur (pas l'icône cible).
+    if (pr.score) detailLabel = `Ton prono : ${pr.score}`;
+    else if (oc) detailLabel = `Ton prono : ${oc === '1' ? m.h : oc === '2' ? m.a : 'Nul'}`;
+    else detailLabel = `Pas de prono`;
+  } else if (pr.score) {
+    detailLabel = `Score ${pr.score} — modifier`;   // icône cible retirée
+  } else {
+    detailLabel = `<span class="pmx-cta-ico">🎯</span> Fais ton pronostic`;
+  }
+
+  return `<div class="pmx-card ${played ? 'pmx-played' : ''}" id="pmx-${key}">
+    <div class="pmx-top">
+      <div class="pmx-team"><span class="pmx-fl">${hInfo?.flag || ''}</span><span class="pmx-nm">${m.h}</span></div>
+      <div class="pmx-cen">${emptyScore
+        ? `<span class="pmx-score pmx-score-empty"><span class="pmx-sc-n">–</span><span class="pmx-sc-dash">-</span><span class="pmx-sc-n">–</span></span>`
+        : played ? `<span class="pmx-score">${_colorScore(real, hc, ac)}</span>` : `<span class="pmx-vs">VS</span>`}<span class="pmx-date">${m.t || ''}</span></div>
+      <div class="pmx-team pmx-team-r"><span class="pmx-nm">${m.a}</span><span class="pmx-fl">${aInfo?.flag || ''}</span></div>
+    </div>
+    <div class="pmx-bet">
+      <button class="pmx-bx ${on('1')}" ${dis} onclick="pmSetOutcome('${key}','1',this)"><b>1</b><small>${m.h}</small></button>
+      <button class="pmx-bx pmx-bx-n ${on('N')}" ${dis} onclick="pmSetOutcome('${key}','N',this)"><b>N</b><small>Nul</small></button>
+      <button class="pmx-bx ${on('2')}" ${dis} onclick="pmSetOutcome('${key}','2',this)"><b>2</b><small>${m.a}</small></button>
+    </div>
+    <button class="pmx-more ${detail ? 'pmx-more-set' : ''}" onclick="openMatchPronoPanel('${g.id}',${i})">
+      <span>${detailLabel}</span>${detail ? '<span class="pmx-dot"></span>' : '<span class="pmx-chev">›</span>'}
+    </button>
+  </div>`;
 }
 
 function pmSetOutcome(key, val, btn) {
@@ -333,6 +415,16 @@ function pmpOutcome(btn) {
   btn.parentElement.querySelectorAll('.pmp2-ocbtn').forEach(b => b.classList.remove('on'));
   btn.classList.add('on');
   btn.classList.remove('pmx-pop'); void btn.offsetWidth; btn.classList.add('pmx-pop');
+  // « Nul » sans score touché → pré-remplit 0-0 (chiffres en gras, score exact).
+  if (btn.dataset.oc === 'N') {
+    const root = btn.closest('.pmp2');
+    const hIn = root?.querySelector('input[id^="mp-h-"]');
+    const aIn = root?.querySelector('input[id^="mp-a-"]');
+    if (hIn && aIn && hIn.value === '' && aIn.value === '') {
+      hIn.value = 0; aIn.value = 0;
+      pmpScoreChange(hIn.id.slice(5));
+    }
+  }
 }
 function pmpToggle(btn) {
   btn.classList.toggle('on');
@@ -360,8 +452,12 @@ function pmpSave(key) {
   const oc = document.querySelector('.pmp2-oc .pmp2-ocbtn.on')?.dataset.oc || null;
   const hv = document.getElementById('mp-h-' + key)?.value;
   const av = document.getElementById('mp-a-' + key)?.value;
+  // Un champ vide vaut 0 : « 1 » + champ intact → 1-0 ; rien touché → 0-0.
+  const hvSet = hv !== '' && hv != null;
+  const avSet = av !== '' && av != null;
   let score;
-  if (hv !== '' && av !== '' && hv != null && av != null) score = `${parseInt(hv)}-${parseInt(av)}`;
+  if (hvSet || avSet) score = `${parseInt(hv) || 0}-${parseInt(av) || 0}`;
+  else if (!oc) score = '0-0';   // aucun champ ni issue touchés → score par défaut 0-0
   const patch = {
     outcome: oc || _ocFromScore(score),
     homeScorers: _pmSel('mp-hsp-' + key),
@@ -373,8 +469,15 @@ function pmpSave(key) {
   if (score) patch.score = score;
   _pmSave(key, patch);
   if (typeof showNotification === 'function') showNotification('✓ Prono enregistré !', 'success');
-  if (typeof closePanel === 'function') closePanel();
   _renderPronoTabBody();
+  // Enchaîne automatiquement sur le prochain match à pronostiquer.
+  const nextKey = _nextPronoKey(key);
+  if (nextKey) {
+    const [ngid, nidx] = nextKey.split('_');
+    openMatchPronoPanel(ngid, parseInt(nidx));
+  } else if (typeof closePanel === 'function') {
+    closePanel();
+  }
 }
 
 // ── BRACKET PREDICTOR ──────────────────────────────────────────────────
@@ -442,7 +545,7 @@ function _renderBracketPredictor() {
     return `<div class="bp-group ${rk === 4 ? 'bp-group-done' : ''}">
       <div class="bp-group-hd"><span>Groupe ${g.id}</span>
         <span class="bp-group-hd-actions">
-          <button class="bp-form-btn" onclick="bShowForm('${g.id}')" title="Forme des équipes">📊 Forme</button>
+          <button class="bp-form-btn" onclick="bShowForm('${g.id}')" title="Forme des équipes">Forme</button>
           ${rk > 0 ? `<button class="bp-grp-reset" onclick="bResetGroup('${g.id}')" title="Réinitialiser ce groupe">↺</button>` : ''}
         </span>
       </div>
@@ -539,7 +642,7 @@ function _renderKOTree() {
   // champion
   const finalWinner = ko['r4_0'];
   const champHtml = finalWinner
-    ? `<div class="bp-champ"><div class="bp-champ-lbl">🏆 Ton champion</div>
+    ? `<div class="bp-champ"><div class="bp-champ-lbl">Ton champion</div>
         <div class="bp-champ-team">${_flagHtml(finalWinner, 'bp-champ-flag')}<span>${finalWinner}</span></div></div>`
     : '';
 

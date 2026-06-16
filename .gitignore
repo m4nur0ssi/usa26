@@ -23,3 +23,6 @@
 
 # Keep this file
 !.gitignore
+
+# Local Netlify folder
+.netlify
