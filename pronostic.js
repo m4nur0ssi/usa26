@@ -128,6 +128,14 @@ async function cloudPullAll() {
       users[r.pseudo] = _mergeUser(users[r.pseudo] || {}, r.data || {});
     });
     saveUsers(users, true);
+    // Si un utilisateur est connecté et a des pronos en local qui ne sont pas encore
+    // dans le cloud, on les pousse automatiquement après chaque pull.
+    if (currentPseudo && !isRemovedPseudo(currentPseudo)) {
+      const localPronos = users[currentPseudo]?.pronostics || {};
+      if (Object.keys(localPronos).length > 0) {
+        cloudPushUser(currentPseudo);
+      }
+    }
     return true;
   } catch (e) { console.warn('[SYNC] pull failed:', e.message); return false; }
 }
