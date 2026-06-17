@@ -1097,6 +1097,16 @@ function _renderUserHistory() {
       }
     });
 
+    // Polling automatique toutes les 60 s pour voir les paris des autres en temps réel
+    setInterval(() => {
+      cloudPullAll().then(ok => {
+        if (ok) {
+          _updatePseudoIndicator();
+          _refreshAfterAuth();
+        }
+      });
+    }, 60_000);
+
     // If no pseudo after splash (4.5s), show modal once
     if (!currentPseudo) {
       setTimeout(() => {

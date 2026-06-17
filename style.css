@@ -136,6 +136,18 @@ button {
   gap: 10px;
 }
 
+.nav-qr {
+  width: 44px;
+  height: 44px;
+  margin: 0 18px;
+  border-radius: 8px;
+  background: #fff;
+  padding: 3px;
+  object-fit: contain;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+  flex-shrink: 0;
+}
+
 .logo-badge {
   width: 36px;
   height: 36px;
@@ -9730,7 +9742,9 @@ button {
 
 /* ── Center image column (between pitches) ───────────────────────── */
 .cs-center-img-col {
-  flex: 0 0 340px;
+  flex: 1 1 0;
+  min-width: 200px;
+  max-width: 360px;
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -11001,6 +11015,7 @@ button {
 .wch-sc-flag { font-size: 1.4rem; flex-shrink: 0; }
 .wch-sc-info { flex: 0 0 180px; min-width: 0; }
 .wch-sc-name { font-weight: 700; font-size: 0.85rem; color: var(--text-1); }
+.wch-sc-live { display: inline-block; margin-left: 6px; font-size: 0.6rem; font-weight: 800; color: #4ade80; background: rgba(34,197,94,0.16); border: 1px solid rgba(34,197,94,0.35); border-radius: 999px; padding: 1px 6px; vertical-align: middle; letter-spacing: 0.02em; }
 .wch-sc-nation { font-size: 0.65rem; color: var(--text-3); font-weight: 600; margin-top: 1px; }
 .wch-sc-bar-wrap {
   flex: 1;
@@ -11960,6 +11975,12 @@ button {
 .mc-live-cta-btn:hover { background: rgba(239,68,68,0.28); }
 .mc-live-cta-dot { width: 7px; height: 7px; border-radius: 50%; background: #ef4444; box-shadow: 0 0 0 0 rgba(239,68,68,0.6); animation: mcLivePulse 1.4s infinite; }
 @keyframes mcLivePulse { 0% { box-shadow: 0 0 0 0 rgba(239,68,68,0.6); } 70% { box-shadow: 0 0 0 6px rgba(239,68,68,0); } 100% { box-shadow: 0 0 0 0 rgba(239,68,68,0); } }
+.mc-header-cta { display: inline-flex; align-items: center; gap: 6px; }
+.mc-video-cta-btn { display: inline-flex; align-items: center; gap: 5px; background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.14); color: #e5e7eb; font-weight: 700; font-size: 0.72rem; padding: 5px 11px; border-radius: 999px; cursor: pointer; text-decoration: none; transition: all .15s; }
+.mc-video-cta-btn:hover { background: rgba(255,255,255,0.14); }
+.mc-video-cta-btn svg { width: 12px; height: 12px; }
+.mc-result-cta-btn { display: inline-flex; align-items: center; gap: 6px; background: rgba(34,197,94,0.15); border: 1px solid rgba(34,197,94,0.4); color: #4ade80; font-weight: 700; font-size: 0.72rem; padding: 5px 12px; border-radius: 999px; cursor: pointer; transition: all .15s; }
+.mc-result-cta-btn:hover { background: rgba(34,197,94,0.28); }
 
 /* — Live card: my prono above score — */
 .lc-score-block { display: flex; flex-direction: column; align-items: center; gap: 4px; }
@@ -13230,4 +13251,71 @@ button {
   outline-offset: 2px;
   box-shadow: 0 0 0 4px rgba(124,58,237,0.15), 0 10px 30px rgba(124,58,237,0.25);
   transition: outline-color 0.4s, box-shadow 0.4s;
+}
+
+/* ═══ MATCH PITCH PANEL — Mobile scroll fix ════════════════════════════
+   Sur desktop : 2 colonnes fixes (240px) + centre, chaque colonne scroll.
+   Sur mobile  : empilement vertical, panel-body qui scrolle. */
+@media (max-width: 768px) {
+  /* 1. Réactiver le scroll sur le panel-body */
+  .panel-body:has(.mpp-container) {
+    overflow-y: auto !important;
+    padding: 8px 10px 40px;
+  }
+
+  /* 2. Container : hauteur automatique, pas de clip */
+  .mpp-container {
+    height: auto;
+    overflow: visible;
+  }
+
+  /* 3. Corps principal : colonnes empilées verticalement */
+  .mpp-body {
+    flex-direction: column;
+    overflow: visible;
+    height: auto;
+    align-items: stretch;
+    gap: 10px;
+  }
+
+  /* 4. Section centrale (terrain + image) : passe en premier */
+  .mpp-center {
+    order: -1;
+    overflow: visible;
+    width: 100%;
+    flex: none;
+    min-height: 0;
+  }
+  .mpp-conf-img { max-height: 160px; }
+  .mpp-pitch-wrap {
+    flex: none;
+    height: 55vw;
+    min-height: 200px;
+  }
+
+  /* 5. Colonnes d'équipe : pleine largeur, hauteur auto */
+  .mpp-team-col {
+    width: 100%;
+    flex-shrink: 0;
+    overflow-y: auto !important;   /* surcharge le overflow:hidden de .fs-col */
+    max-height: 44vh;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  /* fs-col garde position:relative pour que fs-card-slot (absolu) fonctionne */
+  .mpp-team-col.fs-col {
+    overflow-y: auto !important;
+    position: relative;
+  }
+
+  /* fs-col-body : laisse défiler (le panel gère le scroll global) */
+  .fs-col-body {
+    overflow-y: auto;
+    flex: 1;
+  }
+
+  /* Joueurs : rangées légèrement plus compactes */
+  .mpp-player-row { padding: 5px 6px; }
+  .mpp-photo { width: 30px; height: 30px; }
+  .mpp-pname { font-size: 0.88rem; }
 }
