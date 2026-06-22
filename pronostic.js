@@ -128,17 +128,41 @@ async function cloudPullAll() {
       users[r.pseudo] = _mergeUser(users[r.pseudo] || {}, r.data || {});
     });
     saveUsers(users, true);
-    // Si un utilisateur est connecté et a des pronos en local qui ne sont pas encore
-    // dans le cloud, on les pousse automatiquement après chaque pull.
+    // Si un utilisateur est connecté et a des pronos en local (clé `pronostics`
+    // OU l'ancienne clé `pronos`), on les pousse automatiquement après chaque
+    // pull — garantit que les pronos faits sur cet appareil montent dans le cloud.
     if (currentPseudo && !isRemovedPseudo(currentPseudo)) {
-      const localPronos = users[currentPseudo]?.pronostics || {};
-      if (Object.keys(localPronos).length > 0) {
+      const u = users[currentPseudo] || {};
+      const nLocal = Object.keys(u.pronostics || {}).length + Object.keys(u.pronos || {}).length;
+      if (nLocal > 0) {
         cloudPushUser(currentPseudo);
       }
     }
     return true;
   } catch (e) { console.warn('[SYNC] pull failed:', e.message); return false; }
 }
+// Forcer une synchro complète depuis le classement : pousse mes pronos locaux
+// puis re-télécharge tout le monde et redessine le classement.
+let _forceSyncing = false;
+async function forceSyncPronos() {
+  if (_forceSyncing) return;
+  _forceSyncing = true;
+  const btn = document.getElementById('ldb-sync-btn');
+  if (btn) { btn.disabled = true; btn.dataset.lbl = btn.textContent; btn.textContent = '🔄 Synchro…'; }
+  try {
+    if (currentPseudo && !isRemovedPseudo(currentPseudo)) cloudPushUser(currentPseudo);
+    const ok = await cloudPullAll();
+    if (typeof renderLeaderboard === 'function') renderLeaderboard();
+    _notify(ok ? '✅ Classement synchronisé' : '⚠️ Synchro échouée', ok ? 'success' : 'error');
+  } catch (e) {
+    _notify('⚠️ Synchro échouée', 'error');
+  } finally {
+    _forceSyncing = false;
+    const b2 = document.getElementById('ldb-sync-btn');
+    if (b2) { b2.disabled = false; b2.textContent = b2.dataset.lbl || '🔄 Synchroniser'; }
+  }
+}
+
 function loadReal()  {
   try { return JSON.parse(localStorage.getItem(REAL_KEY)) || {}; } catch { return {}; }
 }
@@ -450,7 +474,7 @@ function getUserStats(pseudo) {
 function getLeaderboard() {
   const users = loadUsers();
   return Object.keys(users)
-    .filter(p => p !== ADMIN_PSEUDO && !isRemovedPseudo(p))
+    .filter(p => p !== ADMIN_PSEUDO && !isRemovedPseudo(p) && !/test/i.test(p))
     .map(pseudo => ({ pseudo, ...getUserStats(pseudo) }))
     .sort((a, b) => b.total - a.total || b.exactScores - a.exactScores || b.matchCount - a.matchCount);
 }
@@ -553,7 +577,7 @@ function openPronoDetail(pseudo, scoreKey) {
 }
 
 // ── SAVE USER PRONOSTIC ────────────────────────────────────────────────────
-function _savePronostic(scoreKey, data) {
+function _savePronostic(scoreKey, data, silent) {
   if (!currentPseudo || pronoIsAdmin) return;
   const users = loadUsers();
   if (!users[currentPseudo]) users[currentPseudo] = { pronostics: {} };
@@ -564,10 +588,35 @@ function _savePronostic(scoreKey, data) {
   const _w = data.score ? _getWinner(data.score) : null;
   if (_w) _merged.outcome = _w === 'H' ? '1' : _w === 'A' ? '2' : 'N';
   users[currentPseudo].pronostics[scoreKey] = _merged;
-  saveUsers(users);
-  _notify('✅ Pronostic enregistré!');
-  // Refresh calendar status circles
-  if (typeof renderCalendar === 'function') renderCalendar();
+  saveUsers(users); // → pousse aussi vers le cloud (cloudPushUser)
+  if (!silent) {
+    _notify('✅ Pronostic enregistré!');
+    if (typeof renderCalendar === 'function') renderCalendar();
+  }
+}
+
+// Auto-sauvegarde (silencieuse) à chaque modif du formulaire : dès qu'un score
+// valide est saisi, le prono est enregistré ET poussé vers le cloud — même si
+// l'utilisateur n'appuie jamais sur « Enregistrer » ou ferme l'app aussitôt.
+let _autoSaveTimer = null;
+function pronoAutoSave(scoreKey) {
+  if (!currentPseudo || pronoIsAdmin) return;
+  const hInput = document.getElementById('ph-' + scoreKey);
+  const aInput = document.getElementById('pa-' + scoreKey);
+  if (!hInput || !aInput || hInput.value === '' || aInput.value === '') return;
+  const hVal = parseInt(hInput.value), aVal = parseInt(aInput.value);
+  if (isNaN(hVal) || isNaN(aVal) || hVal < 0 || aVal < 0) return;
+  const score = `${hVal}-${aVal}`;
+  const homeScorers = _getSelectedNames('pr-hs-' + scoreKey).slice(0, hVal);
+  const awayScorers = _getSelectedNames('pr-as-' + scoreKey).slice(0, aVal);
+  const penalty  = document.getElementById('p-pen-' + scoreKey)?.checked || false;
+  const redCards = parseInt(document.getElementById('p-rc-' + scoreKey)?.value) || 0;
+  clearTimeout(_autoSaveTimer);
+  _autoSaveTimer = setTimeout(() => {
+    _savePronostic(scoreKey, { score, homeScorers, awayScorers, penalty, redCards }, true);
+    const hint = document.querySelector('#prono-section-' + scoreKey + ' .prono-hint');
+    if (hint) hint.innerHTML = `✏️ Enregistré automatiquement : <strong>${score}</strong>`;
+  }, 600);
 }
 
 function _getUserProno(scoreKey) {
@@ -619,6 +668,11 @@ function handlePronoPill(btn) {
     }
   }
   btn.classList.toggle('prono-pill-on');
+  // Auto-save (buteurs) côté utilisateur
+  if (!isAdminMode) {
+    const sk = (btn.dataset.cid || '').replace(/^pr-(hs|as)-/, '');
+    if (sk) pronoAutoSave(sk);
+  }
 }
 
 function _getSelectedNames(containerId) {
@@ -827,10 +881,10 @@ function getPronoSection(scoreKey, homeTeam, awayTeam, hPool, aPool, realScore) 
         <div class="prono-score-row">
           <span class="prono-team-lbl">${homeTeam}</span>
           <input type="number" id="ph-${scoreKey}" class="prono-score-inp" min="0" max="30"
-            value="${initHNum}" placeholder="0" oninput="updatePronoScorers('${scoreKey}')">
+            value="${initHNum}" placeholder="0" oninput="updatePronoScorers('${scoreKey}');pronoAutoSave('${scoreKey}')">
           <span class="prono-sep">–</span>
           <input type="number" id="pa-${scoreKey}" class="prono-score-inp" min="0" max="30"
-            value="${initANum}" placeholder="0" oninput="updatePronoScorers('${scoreKey}')">
+            value="${initANum}" placeholder="0" oninput="updatePronoScorers('${scoreKey}');pronoAutoSave('${scoreKey}')">
           <span class="prono-team-lbl">${awayTeam}</span>
         </div>
         <div id="prono-scorers-${scoreKey}">
@@ -841,11 +895,11 @@ function getPronoSection(scoreKey, homeTeam, awayTeam, hPool, aPool, realScore) 
         </div>
         <div class="prono-extras">
           <label class="prono-extra-lbl">
-            <input type="checkbox" id="p-pen-${scoreKey}" ${up.penalty ? 'checked' : ''}> 🫵 Penalty prévu
+            <input type="checkbox" id="p-pen-${scoreKey}" ${up.penalty ? 'checked' : ''} onchange="pronoAutoSave('${scoreKey}')"> 🫵 Penalty prévu
           </label>
           <label class="prono-extra-lbl">
             🟥 Cartons rouges:
-            <input type="number" id="p-rc-${scoreKey}" class="prono-rc-inp" min="0" max="10" value="${up.redCards || 0}">
+            <input type="number" id="p-rc-${scoreKey}" class="prono-rc-inp" min="0" max="10" value="${up.redCards || 0}" oninput="pronoAutoSave('${scoreKey}')">
           </label>
         </div>
         <div class="prono-hint">
@@ -904,6 +958,7 @@ function renderLeaderboard() {
       <div class="ldb-hero-title">CLASSEMENT</div>
       <div class="ldb-hero-sub">${board.length} joueur${board.length > 1 ? 's' : ''} · ${Object.keys(real).length} match${Object.keys(real).length > 1 ? 's' : ''} joué${Object.keys(real).length > 1 ? 's' : ''}</div>
       ${myRank ? `<div class="ldb-my-rank">Ta position : <strong>#${myRank}</strong></div>` : ''}
+      <button id="ldb-sync-btn" class="ldb-sync-btn" onclick="forceSyncPronos()">🔄 Synchroniser</button>
     </div>
 
     <div class="ldb-list">
@@ -980,11 +1035,14 @@ function _renderPronosForUser(pseudo) {
   const entries = Object.entries(pronos);
   if (!entries.length) return '<div class="ldb-pd-empty">Aucun pronostic</div>';
 
-  // tri : matchs notés d'abord, puis à venir
-  entries.sort(([ka], [kb]) => {
-    const a = real[ka] ? 0 : 1, b = real[kb] ? 0 : 1;
-    return a - b;
-  });
+  // tri : ordre chronologique des matchs (date/heure réelle)
+  const _matchTime = (key) => {
+    const gId = key.split('_')[0];
+    const mIdx = parseInt(key.split('_')[1]);
+    const m = GROUPS.find(g => g.id === gId)?.matches[mIdx];
+    return m?.utc ? Date.parse(m.utc) : Infinity;
+  };
+  entries.sort(([ka], [kb]) => _matchTime(ka) - _matchTime(kb));
 
   return `<div class="ldb-pd-list">${entries.map(([key, prono]) => {
     const gId  = key.split('_')[0];

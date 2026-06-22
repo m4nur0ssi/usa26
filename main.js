@@ -1351,7 +1351,7 @@ coach: 'Daryl Powell', formation: '4-3-3', confederation: 'FIFA', titles: 0,
       { id: 'nor6', name: 'Sander BERGE', pos: 'Milieu', n: 4, age: 27, born: '14/02/1998', h: '1m94', club: 'Fulham', caps: 52, goals: 4, ast: 6, debut: '2018', photo: 'images/players/tsdb_sander_berge.jpg', role: 'Titulaire', bio: 'Milieu défensif de Fulham, colosse physique.' },
       { id: 'nor7', name: 'Martin ØDEGAARD', pos: 'Milieu', n: 8, age: 27, born: '17/12/1998', h: '1m78', club: 'Arsenal', caps: 62, goals: 14, ast: 18, debut: '2014', photo: 'images/players/tsdb_martin_degaard.jpg', role: 'Titulaire', bio: 'Capitaine de Norvège, star d\'Arsenal.' },
       { id: 'nor8', name: 'Fredrik AURSNES', pos: 'Milieu', n: 16, age: 29, born: '10/12/1995', h: '1m76', club: 'Benfica', caps: 38, goals: 3, ast: 5, debut: '2020', photo: 'images/players/tsdb_fredrik_aursnes.jpg', role: 'Titulaire', bio: 'Milieu polyvalent de Benfica.' },
-      { id: 'nor9', name: 'Erling HAALAND', pos: 'Attaquant', n: 9, age: 25, born: '21/07/2000', h: '1m94', club: 'Man. City', caps: 42, goals: 31, ast: 6, debut: '2019', photo: 'images/players/tsdb_erling_haaland.jpg', role: 'Titulaire', bio: 'Machine à buts de Man City. Meilleur buteur de Norvège.' },
+      { id: 'nor9', name: 'Erling HAALAND', pos: 'Attaquant', n: 9, age: 25, born: '21/07/2000', h: '1m94', club: 'Man. City', caps: 42, goals: 33, ast: 6, debut: '2019', photo: 'images/players/tsdb_erling_haaland.jpg', role: 'Titulaire', bio: 'Machine à buts de Man City. Meilleur buteur de Norvège.' },
       { id: 'nor10', name: 'Alexander SØRLOTH', pos: 'Attaquant', n: 11, age: 29, born: '05/12/1995', h: '1m96', club: 'Atlético Madrid', caps: 52, goals: 24, ast: 8, debut: '2015', photo: 'https://img.sofascore.com/api/v1/player/309078/image', role: 'Titulaire', bio: 'Grand attaquant de l\'Atlético Madrid.' },
       { id: 'nor11', name: 'Antonio NUSA', pos: 'Attaquant', n: 7, age: 20, born: '20/06/2004', h: '1m78', club: 'Leverkusen', caps: 18, goals: 5, ast: 4, debut: '2023', photo: 'images/players/tsdb_antonio_nusa.jpg', role: 'Titulaire', bio: 'Prodige de Leverkusen, ailier explosif.' },
       { id: 'nor12', name: 'Matz SELS', pos: 'Gardien', n: 12, age: 33, born: '26/02/1992', h: '1m89', club: 'Nottm Forest', caps: 8, goals: 0, ast: 0, debut: '2022', photo: 'images/players/tsdb_matz_sels.jpg', role: 'Remplaçant', bio: 'Gardien remplaçant.' },
@@ -2796,9 +2796,11 @@ const GROUP_TEAM_IMG = {
   'Autriche':          'images/groupe/j autriche.avif',
   'Algérie':           'images/groupe/j algerie.avif',
   'Jordanie':          'images/groupe/j jordanie.avif',
-  // Group K (colombie + ouzbekistan only have avifs; portugal/rdcongo fallback to equipe)
+  // Group K
+  'Portugal':          'images/groupe/k portugal.avif',
   'Colombie':          'images/groupe/k colombie.avif',
   'Ouzbékistan':       'images/groupe/k ouzbekistan.avif',
+  // RD Congo : pas d'image « groupe » dédiée → on retombe sur le poster équipe
   // Group L
   'Angleterre':        'images/groupe/l angleterre.avif',
   'Croatie':           'images/groupe/l croatie.avif',
@@ -4052,67 +4054,59 @@ function renderCalendar() {
   const container = document.getElementById('calendar-matches');
   if (!container) return;
 
-  // ── MOBILE : rail de dates vertical + cartes épurées ──
-  if (window.matchMedia('(max-width: 768px)').matches) {
-    const now = new Date();
-    const todayStr = `${now.getDate()} ${['Janvier','Février','Mars','Avril','Mai','Juin','Juillet','Août','Septembre','Octobre','Novembre','Décembre'][now.getMonth()]}`;
-    const dateMin = {};
-    GROUPS.forEach(g => g.matches.forEach(m => {
-      const t = m.utc ? new Date(m.utc).getTime() : 0;
-      if (!(m.d in dateMin) || t < dateMin[m.d]) dateMin[m.d] = t;
-    }));
-    const dates = Object.keys(dateMin).sort((a, b) => dateMin[a] - dateMin[b]);
-    const active = (window._calDate && dates.includes(window._calDate)) ? window._calDate
-      : (dates.includes(todayStr) ? todayStr : dates[0]);
+  // ── Rail de dates vertical (mobile ET desktop) ──
+  const isMobile = window.matchMedia('(max-width: 768px)').matches;
 
-    const railHtml = dates.map(d => {
-      const [day, mon] = d.split(' ');
-      return `<button class="ld-chip ${d === active ? 'active' : ''} ${d === todayStr ? 'today' : ''}"
-        onclick="calSelectDate('${d}')"><b>${day}</b><span>${(mon || '').slice(0, 3)}</span></button>`;
-    }).join('');
+  const now = new Date();
+  const todayStr = `${now.getDate()} ${['Janvier','Février','Mars','Avril','Mai','Juin','Juillet','Août','Septembre','Octobre','Novembre','Décembre'][now.getMonth()]}`;
+  const dateMin = {};
+  GROUPS.forEach(g => g.matches.forEach(m => {
+    const t = m.utc ? new Date(m.utc).getTime() : 0;
+    if (!(m.d in dateMin) || t < dateMin[m.d]) dateMin[m.d] = t;
+  }));
+  const dates = Object.keys(dateMin).sort((a, b) => dateMin[a] - dateMin[b]);
+  const active = (window._calDate && dates.includes(window._calDate)) ? window._calDate
+    : (dates.includes(todayStr) ? todayStr : dates[0]);
 
-    const dayMatches = [];
-    GROUPS.forEach(g => g.matches.forEach((m, i) => { if (m.d === active) dayMatches.push({ g, m, i }); }));
-    dayMatches.sort((a, b) => new Date(a.m.utc || 0) - new Date(b.m.utc || 0));
+  const railHtml = dates.map(d => {
+    const [day, mon] = d.split(' ');
+    return `<button class="ld-chip ${d === active ? 'active' : ''} ${d === todayStr ? 'today' : ''}"
+      onclick="calSelectDate('${d}')"><b>${day}</b><span>${(mon || '').slice(0, 3)}</span></button>`;
+  }).join('');
 
-    const prevRail = document.getElementById('cal-rail');
-    const prevScroll = prevRail ? prevRail.scrollTop : null;
+  const dayMatches = [];
+  GROUPS.forEach(g => g.matches.forEach((m, i) => { if (m.d === active) dayMatches.push({ g, m, i }); }));
+  dayMatches.sort((a, b) => new Date(a.m.utc || 0) - new Date(b.m.utc || 0));
 
-    container.innerHTML = `
-      <div class="live-timeline">
-        <div class="live-rail" id="cal-rail">${railHtml}</div>
-        <div class="live-day-content">
-          <div class="cal-day-label">${active} 2026</div>
-          ${dayMatches.length
-            ? `<div class="mr-list">${dayMatches.map(x => renderMatchRowMobile(x.g, x.m, x.i)).join('')}</div>`
-            : `<div class="live-hero"><div class="live-hero-icon">📅</div><div class="live-hero-title">Pas de match ce jour</div></div>`}
-        </div>
-      </div>`;
+  const prevRail = document.getElementById('cal-rail');
+  const prevScroll = prevRail ? prevRail.scrollTop : null;
 
-    const rail = document.getElementById('cal-rail');
-    if (rail) {
-      if (prevScroll !== null) rail.scrollTop = prevScroll;
-      else {
-        const act = rail.querySelector('.ld-chip.active');
-        if (act) rail.scrollTop = Math.max(act.offsetTop - rail.clientHeight / 2 + 28, 0);
-      }
-    }
-    return;
+  let dayInner;
+  if (!dayMatches.length) {
+    dayInner = `<div class="live-hero"><div class="live-hero-icon">📅</div><div class="live-hero-title">Pas de match ce jour</div></div>`;
+  } else if (isMobile) {
+    dayInner = `<div class="mr-list">${dayMatches.map(x => renderMatchRowMobile(x.g, x.m, x.i)).join('')}</div>`;
+  } else {
+    dayInner = `<div class="calendar-matches">${dayMatches.map(x => renderMatchCard(x.g, x.m, x.i)).join('')}</div>`;
   }
 
-  const filterGroup = document.getElementById('calendar-filter')?.value || 'all';
-  const groups = filterGroup === 'all' ? GROUPS : GROUPS.filter(g => g.id === filterGroup);
-  container.innerHTML = groups.map(g => `
-    <div class="calendar-group-section">
-      <div class="calendar-group-header">
-        <span class="calendar-group-letter">Groupe ${g.id}</span>
-        <span class="calendar-group-teams">${g.teams.map(t => t.flag).join(' ')}</span>
+  container.innerHTML = `
+    <div class="live-timeline${isMobile ? '' : ' cal-desktop-timeline'}">
+      <div class="live-rail" id="cal-rail">${railHtml}</div>
+      <div class="live-day-content">
+        <div class="cal-day-label">${active} 2026</div>
+        ${dayInner}
       </div>
-      <div class="calendar-matches">
-        ${g.matches.map((m, i) => renderMatchCard(g, m, i)).join('')}
-      </div>
-    </div>
-  `).join('');
+    </div>`;
+
+  const rail = document.getElementById('cal-rail');
+  if (rail) {
+    if (prevScroll !== null) rail.scrollTop = prevScroll;
+    else {
+      const act = rail.querySelector('.ld-chip.active');
+      if (act) rail.scrollTop = Math.max(act.offsetTop - rail.clientHeight / 2 + 28, 0);
+    }
+  }
 }
 
 function renderMatchCard(g, m, i) {
@@ -4229,8 +4223,16 @@ function renderMatchCard(g, m, i) {
       </div>
     </div>`;
 
-  const liveBtn = `<div class="mc-prono-cta-wrap"><button class="mc-live-cta-btn" onclick="event.stopPropagation();switchView('live')"><span class="mc-live-cta-dot"></span>Voir Live</button></div>`;
-  const staticHeader = `<div class="mc-static-header"><span class="mc-date">${m.d} · ${m.t}</span>${_isAdmin ? editBtn : liveBtn}</div>`;
+  // ── CTA : vidéo (à gauche) + Voir Live / Résultat ──
+  const _played = liveStatus === 'finished' || (!!score && !isLive);
+  const _videoBtn = isMatchVideoReady(m)
+    ? `<a class="mc-video-cta-btn" href="${getMatchVideoUrl(scoreKey, m)}" target="_blank" rel="noopener" onclick="event.stopPropagation()"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>Vidéo</a>`
+    : '';
+  const _mainBtn = _played
+    ? `<button class="mc-result-cta-btn" onclick="event.stopPropagation();openMatchPitchPanel('${g.id}',${i})">Résultat</button>`
+    : `<button class="mc-live-cta-btn" onclick="event.stopPropagation();switchView('live')"><span class="mc-live-cta-dot"></span>Voir Live</button>`;
+  const liveBtn = `<div class="mc-prono-cta-wrap">${_videoBtn}${_mainBtn}</div>`;
+  const staticHeader = `<div class="mc-static-header"><span class="mc-date">${m.d} · ${m.t}</span><div class="mc-header-cta">${_isAdmin ? editBtn : ''}${liveBtn}</div></div>`;
   return `<div class="mc-card-outer">${staticHeader}<div class="mc-flip-wrapper">${frontCard}${backCard}</div></div>`;
 }
 
@@ -5078,16 +5080,45 @@ function renderStats() {
         </div>`;
       }).join('');
 
+  // ── Buts/passes WC 2026 (live) fusionnés dans les totaux all-time ──
+  // Les classements historiques sont statiques ; on y ajoute les buts/passes
+  // marqués lors de l'édition 2026 pour rester cohérents avec le live.
+  // Ex : Messi triplé contre l'Algérie → 13 (2006-2022) + 3 = 16.
+  const wc2026ByLast = {};
+  const _addLast = (rawName, field) => {
+    const nm = (rawName || '').replace(/^\d+'(?:\+\d+')?\s*/, '').replace(/\s*\((pen|csc)\)$/, '').trim();
+    const last = nm.split(' ').pop().toLowerCase();
+    if (!last) return;
+    if (!wc2026ByLast[last]) wc2026ByLast[last] = { goals: 0, assists: 0 };
+    wc2026ByLast[last][field]++;
+  };
+  Object.values(state.scorers || {}).forEach(({ home = [], away = [], homeAssists = [], awayAssists = [] }) => {
+    home.forEach(n => _addLast(n, 'goals'));
+    away.forEach(n => _addLast(n, 'goals'));
+    homeAssists.forEach(n => _addLast(n, 'assists'));
+    awayAssists.forEach(n => _addLast(n, 'assists'));
+  });
+  const live2026For = (fullName, field) => {
+    const last = (fullName || '').split(' ').pop().toLowerCase();
+    return wc2026ByLast[last] ? wc2026ByLast[last][field] : 0;
+  };
+  const mergeLive = (list, field) => list.map(s => {
+    const add = live2026For(s.name, field);
+    if (!add) return s;
+    return { ...s, [field]: s[field] + add, editions: s.editions.replace(/[–-]\s*\d{4}$/, '–2026'), _live: add };
+  });
+
   // ── Historical scorers ──
-  const maxGoals = WC_HISTORY.allTimeScorers.reduce((m, s) => Math.max(m, s.goals), 0);
-  const sortedHist = [...WC_HISTORY.allTimeScorers].sort((a, b) => b.goals - a.goals).slice(0, 15);
+  const allScorers = mergeLive(WC_HISTORY.allTimeScorers, 'goals');
+  const maxGoals = allScorers.reduce((m, s) => Math.max(m, s.goals), 0);
+  const sortedHist = [...allScorers].sort((a, b) => b.goals - a.goals).slice(0, 15);
   const histScorersHTML = sortedHist.map((s, i) => `
     <div class="wch-scorer-row" style="--delay:${i * 50}ms">
       <div class="wch-sc-rank">${medals[i] || (i+1)}</div>
       <div class="wch-sc-flag">${s.flag}</div>
       ${s.img ? `<img class="wch-sc-photo" src="${s.img}" onerror="this.style.display='none'">` : ''}
       <div class="wch-sc-info">
-        <div class="wch-sc-name">${s.name}</div>
+        <div class="wch-sc-name">${s.name}${s._live ? ` <span class="wch-sc-live">+${s._live} '26</span>` : ''}</div>
         <div class="wch-sc-nation">${s.nation} · ${s.editions}</div>
       </div>
       <div class="wch-sc-bar-wrap"><div class="wch-sc-bar" style="--w:${(s.goals/maxGoals)*100}%"></div></div>
@@ -5095,14 +5126,16 @@ function renderStats() {
     </div>`).join('');
 
   // ── Historical passeurs ──
-  const maxAssists = WC_HISTORY.allTimePasseurs.reduce((m, s) => Math.max(m, s.assists), 0);
-  const histPasseursHTML = WC_HISTORY.allTimePasseurs.map((s, i) => `
+  const allPasseurs = mergeLive(WC_HISTORY.allTimePasseurs, 'assists');
+  const maxAssists = allPasseurs.reduce((m, s) => Math.max(m, s.assists), 0);
+  const sortedPasseurs = [...allPasseurs].sort((a, b) => b.assists - a.assists);
+  const histPasseursHTML = sortedPasseurs.map((s, i) => `
     <div class="wch-scorer-row" style="--delay:${i * 50}ms">
       <div class="wch-sc-rank">${medals[i] || (i+1)}</div>
       <div class="wch-sc-flag">${s.flag}</div>
       ${s.img ? `<img class="wch-sc-photo" src="${s.img}" onerror="this.style.display='none'">` : ''}
       <div class="wch-sc-info">
-        <div class="wch-sc-name">${s.name}</div>
+        <div class="wch-sc-name">${s.name}${s._live ? ` <span class="wch-sc-live">+${s._live} '26</span>` : ''}</div>
         <div class="wch-sc-nation">${s.nation} · ${s.editions}</div>
       </div>
       <div class="wch-sc-bar-wrap"><div class="wch-sc-bar" style="--w:${(s.assists/maxAssists)*100}%;background:var(--accent-2,#8b5cf6)"></div></div>
