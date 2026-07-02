@@ -484,7 +484,8 @@ function openPronoDetail(pseudo, scoreKey) {
   const users = loadUsers();
   const prono = users[pseudo]?.pronostics?.[scoreKey] || users[pseudo]?.pronos?.[scoreKey];
   const [gid, idxS] = scoreKey.split('_');
-  const g = (typeof GROUPS !== 'undefined') ? GROUPS.find(x => x.id === gid) : null;
+  const g = (typeof _findFixtureGroup === 'function') ? _findFixtureGroup(gid)
+    : ((typeof GROUPS !== 'undefined') ? GROUPS.find(x => x.id === gid) : null);
   const m = g?.matches[parseInt(idxS)];
   if (!prono || !m) return;
   const real = _effectiveReal()[scoreKey] || null;
@@ -686,7 +687,9 @@ function updatePronoScorers(scoreKey) {
   const container = document.getElementById('prono-scorers-' + scoreKey);
   if (!container) return;
   const key = scoreKey;
-  const group = GROUPS.find(g => g.matches.some((_, i) => g.id + '_' + i === key));
+  const gid = key.split('_')[0];
+  const group = (typeof _findFixtureGroup === 'function') ? _findFixtureGroup(gid)
+    : GROUPS.find(g => g.matches.some((_, i) => g.id + '_' + i === key));
   if (!group) return;
   const mIdx = parseInt(key.split('_')[1]);
   const m    = group.matches[mIdx];
@@ -1014,8 +1017,15 @@ function ldbTogglePronos(card, pseudo) {
   arrow.style.transform = 'rotate(90deg)';
   drawer.innerHTML = _renderPronosForUser(pseudo);
   drawer.style.maxHeight = drawer.scrollHeight + 'px';
-  // libère la hauteur après l'animation pour laisser les détails se déplier
-  setTimeout(() => { if (card.classList.contains('ldb-open')) drawer.style.maxHeight = 'none'; }, 400);
+  // libère la hauteur après l'animation pour laisser les détails se déplier,
+  // puis amène directement au dernier match joué (le plus récent, en bas).
+  setTimeout(() => {
+    if (!card.classList.contains('ldb-open')) return;
+    drawer.style.maxHeight = 'none';
+    const items = drawer.querySelectorAll('.ldb-pd-item');
+    const last = items[items.length - 1];
+    if (last) last.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }, 420);
 }
 
 // Déplie/replie le détail d'un prono (score réel, buteurs, cartons)
@@ -1035,11 +1045,13 @@ function _renderPronosForUser(pseudo) {
   const entries = Object.entries(pronos);
   if (!entries.length) return '<div class="ldb-pd-empty">Aucun pronostic</div>';
 
-  // tri : ordre chronologique des matchs (date/heure réelle)
+  // tri : ordre chronologique des matchs (date/heure réelle) — phase de groupes
+  // ET phase finale (KO) ; le plus récent finit en bas.
+  const _grp = (gId) => (typeof _findFixtureGroup === 'function') ? _findFixtureGroup(gId) : GROUPS.find(g => g.id === gId);
   const _matchTime = (key) => {
     const gId = key.split('_')[0];
     const mIdx = parseInt(key.split('_')[1]);
-    const m = GROUPS.find(g => g.id === gId)?.matches[mIdx];
+    const m = _grp(gId)?.matches[mIdx];
     return m?.utc ? Date.parse(m.utc) : Infinity;
   };
   entries.sort(([ka], [kb]) => _matchTime(ka) - _matchTime(kb));
@@ -1047,7 +1059,7 @@ function _renderPronosForUser(pseudo) {
   return `<div class="ldb-pd-list">${entries.map(([key, prono]) => {
     const gId  = key.split('_')[0];
     const mIdx = parseInt(key.split('_')[1]);
-    const group = GROUPS.find(g => g.id === gId);
+    const group = _grp(gId);
     const match = group?.matches[mIdx];
     if (!match) return '';
     const hInfo = group.teams.find(t => t.name === match.h);
@@ -1122,7 +1134,7 @@ function _renderUserHistory() {
     const pts = realMatch ? scorePoints(prono, realMatch) : null;
     const gId = key.split('_')[0];
     const mIdx = parseInt(key.split('_')[1]);
-    const group = GROUPS.find(g => g.id === gId);
+    const group = (typeof _findFixtureGroup === 'function') ? _findFixtureGroup(gId) : GROUPS.find(g => g.id === gId);
     const match = group?.matches[mIdx];
     const label = match ? `${match.h} vs ${match.a}` : key;
     const ptsDisplay = pts

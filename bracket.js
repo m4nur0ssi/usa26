@@ -110,7 +110,7 @@ function _renderPronoTabBody() {
 function _scrollToCurrentPronoMatch() {
   let liveKey = null, nextKey = null, nextTime = Infinity;
   const now = Date.now();
-  GROUPS.forEach(g => g.matches.forEach((m, i) => {
+  (typeof _allFixtureGroups === 'function' ? _allFixtureGroups() : GROUPS).forEach(g => g.matches.forEach((m, i) => {
     const key = g.id + '_' + i;
     const st = (typeof matchLiveStatus === 'function') ? matchLiveStatus(m) : 'upcoming';
     if (st === 'live' && !liveKey) liveKey = key;
@@ -174,7 +174,12 @@ function _colorScore(real, hc, ac) {
 // Tous les matchs aplatis et triés chronologiquement.
 function _pronoMatchesSorted() {
   const arr = [];
-  GROUPS.forEach(g => g.matches.forEach((m, i) => {
+  const groups = (typeof _allFixtureGroups === 'function') ? _allFixtureGroups() : GROUPS;
+  const resolved = (n) => typeof _koTeamByName === 'function' && !!_koTeamByName(n);
+  groups.forEach(g => g.matches.forEach((m, i) => {
+    // Pour la phase finale : on n'affiche que les matchs dont les 2 équipes
+    // sont connues (sinon "Vainqueur M73" non pronostiquable).
+    if (m._ko && !(resolved(m.h) && resolved(m.a))) return;
     const key = g.id + '_' + i;
     const t = m.utc ? new Date(m.utc).getTime() : Infinity;
     arr.push({ g, m, i, key, t });
@@ -273,7 +278,7 @@ function pmSetOutcome(key, val, btn) {
 
 // ── MATCH PRONO PANEL (redesigned) ──────────────────────────────────────
 function openMatchPronoPanel(groupId, idx) {
-  const g = GROUPS.find(x => x.id === groupId); if (!g) return;
+  const g = (typeof _findFixtureGroup === 'function' ? _findFixtureGroup(groupId) : GROUPS.find(x => x.id === groupId)); if (!g) return;
   const m = g.matches[idx]; if (!m) return;
   const key = groupId + '_' + idx;
   const real = (typeof state !== 'undefined' && state.scores[key]) || m.s || '';
@@ -438,7 +443,8 @@ function pmpStep(id, d) {
   if (id.startsWith('mp-h-') || id.startsWith('mp-a-')) pmpScoreChange(id.slice(5));
 }
 function pmpScoreChange(key) {
-  const g = GROUPS.find(x => x.matches.some((_, i) => x.id + '_' + i === key)); if (!g) return;
+  const gid = key.split('_')[0];
+  const g = (typeof _findFixtureGroup === 'function' ? _findFixtureGroup(gid) : GROUPS.find(x => x.id === gid)); if (!g) return;
   const idx = parseInt(key.split('_')[1]); const m = g.matches[idx]; if (!m) return;
   const hT = _titulaires(m.h), hR = _remplacants(m.h), aT = _titulaires(m.a), aR = _remplacants(m.a);
   const hN = parseInt(document.getElementById('mp-h-' + key)?.value) || 0;

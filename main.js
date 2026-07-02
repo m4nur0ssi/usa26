@@ -1775,14 +1775,17 @@ async function fetchLiveScores(dateRange) {
   }
 
   let changed = false;
+  // Phase de groupes + phase finale : permet à l'API live (ESPN) de remplir
+  // aussi les scores/buteurs des 16es→finale (clés R32_*, R16_*, …).
+  const FIXG = _allFixtureGroups();
 
   events.forEach(ev => {
     const homeFR = ESPN_TO_FR[ev.home] || ev.home;
     const awayFR = ESPN_TO_FR[ev.away] || ev.away;
 
-    // Trouver la clé dans nos groupes
+    // Trouver la clé dans nos groupes + phase finale
     let foundKey = null, swapped = false;
-    GROUPS.forEach(g => {
+    FIXG.forEach(g => {
       g.matches.forEach((m, i) => {
         if (m.h === homeFR && m.a === awayFR) { foundKey = g.id + '_' + i; swapped = false; }
         else if (m.h === awayFR && m.a === homeFR) { foundKey = g.id + '_' + i; swapped = true; }
@@ -1879,7 +1882,7 @@ function updateNasIndicator(ok, source) {
 // ── RÉSUMÉ DE MATCH (page stats après clic sur un match joué) ─────────
 function gpMatchClick(gid, i) {
   const key = gid + '_' + i;
-  if (state.scores[key] && window.matchMedia('(max-width: 768px)').matches) {
+  if (state.scores[key]) {
     openMatchSummary(gid, i);
   } else {
     openMatchPitchPanel(gid, i);
@@ -1887,7 +1890,7 @@ function gpMatchClick(gid, i) {
 }
 
 function openMatchSummary(gid, i) {
-  const g = GROUPS.find(x => x.id === gid);
+  const g = _findFixtureGroup(gid);
   const m = g?.matches[i];
   if (!m) return;
   const key = gid + '_' + i;
@@ -1979,7 +1982,7 @@ async function _fillMatchStats(key) {
 
     // header : titre à gauche, bouton vidéo à droite (1h après la fin)
     const _kp = key.split('_');
-    const _g = GROUPS.find(x => x.id === _kp[0]);
+    const _g = _findFixtureGroup(_kp[0]);
     const _m = _g?.matches[parseInt(_kp[1])];
     const videoBtn = (_m && isMatchVideoReady(_m))
       ? `<a class="ms-video-btn" href="${getMatchVideoUrl(key, _m)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">
@@ -3102,7 +3105,7 @@ function renderConfrontWCStats(homeTeam, awayTeam, hFlag, aFlag) {
 }
 
 function openMatchPitchPanel(groupId, matchIdx) {
-  const group = GROUPS.find(g => g.id === groupId);
+  const group = _findFixtureGroup(groupId);
   if (!group) return;
   const m = group.matches[matchIdx];
   if (!m) return;
@@ -3908,9 +3911,22 @@ function openPlayerPanel(teamName, playerId) {
   // WC 2026 stats from live scorers
   const shortName = cleanPlayerName(p.name).split(' ').pop();
   let wc26goals = 0, wc26assists = 0;
-  Object.values(state.scorers || {}).forEach(({ home=[], away=[], homeAssists=[], awayAssists=[] }) => {
-    [...home,...away].forEach(n => { if(n&&(n.includes(shortName)||shortName.includes(n.split(' ').pop()))) wc26goals++; });
-    [...homeAssists,...awayAssists].forEach(n => { if(n&&(n.includes(shortName)||shortName.includes(n.split(' ').pop()))) wc26assists++; });
+  const _nmMatch = (n) => n && (n.includes(shortName) || shortName.includes(n.split(' ').pop()));
+  // On ne compte QUE les buts/passes des matchs où joue l'équipe du joueur :
+  // évite d'attribuer à un joueur les buts d'un homonyme d'un autre pays.
+  Object.entries(state.scorers || {}).forEach(([key, sc]) => {
+    const kp = key.split('_');
+    const grp = (typeof _findFixtureGroup === 'function') ? _findFixtureGroup(kp[0]) : null;
+    const m = grp?.matches[parseInt(kp[1])];
+    if (!m) return;
+    if (m.h === teamName) {
+      (sc.home || []).forEach(n => { if (_nmMatch(n)) wc26goals++; });
+      (sc.homeAssists || []).forEach(n => { if (_nmMatch(n)) wc26assists++; });
+    }
+    if (m.a === teamName) {
+      (sc.away || []).forEach(n => { if (_nmMatch(n)) wc26goals++; });
+      (sc.awayAssists || []).forEach(n => { if (_nmMatch(n)) wc26assists++; });
+    }
   });
   const wc26html = (wc26goals > 0 || wc26assists > 0) ? `
     <div class="pp-wc26">
@@ -4040,7 +4056,7 @@ function renderMatchRowMobile(g, m, i) {
   } else if (score) {
     mid = `<div class="mr-score">${scoreDisp}</div><div class="mr-status">Terminé</div>`;
   } else {
-    mid = `<div class="mr-time">${m.t}</div><div class="mr-status">Groupe ${g.id}</div>`;
+    mid = `<div class="mr-time">${m.t}</div><div class="mr-status">${m._ko ? _koRoundNameOf(g.id) : 'Groupe ' + g.id}</div>`;
   }
   return `
   <div class="mr-card ${status === 'live' ? 'mr-card-live' : ''}" onclick="gpMatchClick('${g.id}',${i})">
@@ -4059,8 +4075,10 @@ function renderCalendar() {
 
   const now = new Date();
   const todayStr = `${now.getDate()} ${['Janvier','Février','Mars','Avril','Mai','Juin','Juillet','Août','Septembre','Octobre','Novembre','Décembre'][now.getMonth()]}`;
+  const FIX = _allFixtureGroups();
   const dateMin = {};
-  GROUPS.forEach(g => g.matches.forEach(m => {
+  FIX.forEach(g => g.matches.forEach(m => {
+    if (!m.d) return;
     const t = m.utc ? new Date(m.utc).getTime() : 0;
     if (!(m.d in dateMin) || t < dateMin[m.d]) dateMin[m.d] = t;
   }));
@@ -4070,12 +4088,13 @@ function renderCalendar() {
 
   const railHtml = dates.map(d => {
     const [day, mon] = d.split(' ');
+    const monAbbr = mon === 'Juillet' ? 'Juil' : (mon || '').slice(0, 3);
     return `<button class="ld-chip ${d === active ? 'active' : ''} ${d === todayStr ? 'today' : ''}"
-      onclick="calSelectDate('${d}')"><b>${day}</b><span>${(mon || '').slice(0, 3)}</span></button>`;
+      onclick="calSelectDate('${d}')"><b>${day}</b><span>${monAbbr}</span></button>`;
   }).join('');
 
   const dayMatches = [];
-  GROUPS.forEach(g => g.matches.forEach((m, i) => { if (m.d === active) dayMatches.push({ g, m, i }); }));
+  FIX.forEach(g => g.matches.forEach((m, i) => { if (m.d === active) dayMatches.push({ g, m, i }); }));
   dayMatches.sort((a, b) => new Date(a.m.utc || 0) - new Date(b.m.utc || 0));
 
   const prevRail = document.getElementById('cal-rail');
@@ -4310,9 +4329,11 @@ function renderLiveView() {
   const now = new Date();
   const todayStr = `${now.getDate()} ${['Janvier','Février','Mars','Avril','Mai','Juin','Juillet','Août','Septembre','Octobre','Novembre','Décembre'][now.getMonth()]}`;
 
+  const FIX = _allFixtureGroups();
+
   // Collect all matches for today
   const todayMatches = [];
-  GROUPS.forEach(g => {
+  FIX.forEach(g => {
     g.matches.forEach((m, i) => {
       if (m.d === todayStr) {
         todayMatches.push({ g, m, i });
@@ -4322,7 +4343,8 @@ function renderLiveView() {
 
   // Matchs futurs (hors aujourd'hui), triés chronologiquement
   const allFuture = [];
-  GROUPS.forEach(g => g.matches.forEach((m, i) => {
+  FIX.forEach(g => g.matches.forEach((m, i) => {
+    if (!m.d) return;
     if (m.d === todayStr) return;
     let matchDate;
     if (m.utc) {
@@ -4345,7 +4367,7 @@ function renderLiveView() {
   const yd = new Date(now.getTime() - 86400000);
   const yStr = `${yd.getDate()} ${MONTHS_ARR[yd.getMonth()]}`;
   const yesterdayMatches = [];
-  GROUPS.forEach(g => g.matches.forEach((m, i) => { if (m.d === yStr) yesterdayMatches.push({ g, m, i }); }));
+  FIX.forEach(g => g.matches.forEach((m, i) => { if (m.d === yStr) yesterdayMatches.push({ g, m, i }); }));
 
   const tab = window._liveTab || 'today';
   const tabsHtml = `
@@ -4948,31 +4970,44 @@ function renderStats() {
   const medals = ['🥇','🥈','🥉'];
 
   // ── WC 2026 live scorers (noms nettoyés de la minute, équipe associée) ──
+  // Clé = nom + équipe : 2 joueurs homonymes de pays différents (ex. Ronaldo
+  // brésilien ≠ Cristiano Ronaldo portugais) restent des lignes distinctes.
   const wc2026GoalMap = {};
   Object.entries(state.scorers || {}).forEach(([key, { home = [], away = [] }]) => {
     const kp = key.split('_');
-    const grp = GROUPS.find(g => g.id === kp[0]);
+    const grp = _findFixtureGroup(kp[0]);
     const match = grp?.matches[parseInt(kp[1])];
     const add = (n, teamName) => {
       const name = (n || '').replace(/^\d+'(?:\+\d+')?\s*/, '').replace(/\s*\((pen|csc)\)$/, '').trim();
       if (!name) return;
-      if (!wc2026GoalMap[name]) wc2026GoalMap[name] = { goals: 0, team: teamName || '' };
-      wc2026GoalMap[name].goals++;
+      const mapKey = name + '|' + (teamName || '');
+      if (!wc2026GoalMap[mapKey]) wc2026GoalMap[mapKey] = { name, goals: 0, team: teamName || '' };
+      wc2026GoalMap[mapKey].goals++;
     };
     home.forEach(n => add(n, match?.h));
     away.forEach(n => add(n, match?.a));
   });
-  const wc2026Entries = Object.entries(wc2026GoalMap)
-    .map(([name, v]) => [name, v.goals, v.team])
+  const wc2026Entries = Object.values(wc2026GoalMap)
+    .map(v => [v.name, v.goals, v.team])
     .sort((a, b) => b[1] - a[1]);
 
-  function findPlayerInfo(name) {
+  // Cherche le joueur DANS son équipe connue d'abord (évite l'homonyme d'un
+  // autre pays), puis fallback global.
+  function findPlayerInfo(name, teamName) {
     const lower = name.toLowerCase();
+    const matchIn = (td) => td.players.find(pl =>
+      pl.name.toLowerCase().includes(lower) ||
+      lower.includes(pl.name.split(' ').pop().toLowerCase())
+    );
+    // Équipe connue → on garde TOUJOURS son drapeau (jamais celui d'un
+    // homonyme d'un autre pays) ; la photo seulement si le joueur y est trouvé.
+    if (teamName && TEAMS[teamName]) {
+      const p = matchIn(TEAMS[teamName]);
+      return { flag: TEAMS[teamName].flag, photo: p ? (p.photo || '') : '' };
+    }
+    // Équipe inconnue → recherche floue globale.
     for (const [, td] of Object.entries(TEAMS)) {
-      const p = td.players.find(pl =>
-        pl.name.toLowerCase().includes(lower) ||
-        lower.includes(pl.name.split(' ').pop().toLowerCase())
-      );
+      const p = matchIn(td);
       if (p) return { flag: td.flag, photo: p.photo || '' };
     }
     return { flag: '', photo: '' };
@@ -4988,7 +5023,7 @@ function renderStats() {
   const wc2026ScorersHtml = wc2026Entries.length === 0
     ? emptyLive('⚽', 'Aucun buteur enregistré', 'Les stats se mettront à jour au fil des matchs · Saisie via l\'onglet Calendrier')
     : wc2026Entries.map(([name, goals, teamName], i) => {
-        const { flag, photo } = findPlayerInfo(name);
+        const { flag, photo } = findPlayerInfo(name, teamName);
         const teamFlag = flag || GROUPS.flatMap(g => g.teams).find(t => t.name === teamName)?.flag || '⚽';
         return `<div class="wch-scorer-row" style="--delay:${i * 40}ms">
           <div class="wch-sc-rank">${medals[i] || (i + 1)}</div>
@@ -5084,26 +5119,35 @@ function renderStats() {
   // Les classements historiques sont statiques ; on y ajoute les buts/passes
   // marqués lors de l'édition 2026 pour rester cohérents avec le live.
   // Ex : Messi triplé contre l'Algérie → 13 (2006-2022) + 3 = 16.
+  // Clé = nom de famille + drapeau pays : sépare les homonymes de pays
+  // différents (Ronaldo 🇧🇷 ≠ Cristiano Ronaldo 🇵🇹, tous deux au top all-time).
   const wc2026ByLast = {};
-  const _addLast = (rawName, field) => {
+  const _flagOfTeam = (tn) => GROUPS.flatMap(g => g.teams).find(t => t.name === tn)?.flag || '';
+  const _addLast = (rawName, field, flag) => {
     const nm = (rawName || '').replace(/^\d+'(?:\+\d+')?\s*/, '').replace(/\s*\((pen|csc)\)$/, '').trim();
     const last = nm.split(' ').pop().toLowerCase();
     if (!last) return;
-    if (!wc2026ByLast[last]) wc2026ByLast[last] = { goals: 0, assists: 0 };
-    wc2026ByLast[last][field]++;
+    const k = last + '|' + (flag || '');
+    if (!wc2026ByLast[k]) wc2026ByLast[k] = { goals: 0, assists: 0 };
+    wc2026ByLast[k][field]++;
   };
-  Object.values(state.scorers || {}).forEach(({ home = [], away = [], homeAssists = [], awayAssists = [] }) => {
-    home.forEach(n => _addLast(n, 'goals'));
-    away.forEach(n => _addLast(n, 'goals'));
-    homeAssists.forEach(n => _addLast(n, 'assists'));
-    awayAssists.forEach(n => _addLast(n, 'assists'));
+  Object.entries(state.scorers || {}).forEach(([key, sc]) => {
+    const kp = key.split('_');
+    const grp = (typeof _findFixtureGroup === 'function') ? _findFixtureGroup(kp[0]) : null;
+    const m = grp?.matches[parseInt(kp[1])];
+    const hf = _flagOfTeam(m?.h), af = _flagOfTeam(m?.a);
+    (sc.home || []).forEach(n => _addLast(n, 'goals', hf));
+    (sc.away || []).forEach(n => _addLast(n, 'goals', af));
+    (sc.homeAssists || []).forEach(n => _addLast(n, 'assists', hf));
+    (sc.awayAssists || []).forEach(n => _addLast(n, 'assists', af));
   });
-  const live2026For = (fullName, field) => {
+  const live2026For = (fullName, field, flag) => {
     const last = (fullName || '').split(' ').pop().toLowerCase();
-    return wc2026ByLast[last] ? wc2026ByLast[last][field] : 0;
+    const e = wc2026ByLast[last + '|' + (flag || '')];
+    return e ? e[field] : 0;
   };
   const mergeLive = (list, field) => list.map(s => {
-    const add = live2026For(s.name, field);
+    const add = live2026For(s.name, field, s.flag);
     if (!add) return s;
     return { ...s, [field]: s[field] + add, editions: s.editions.replace(/[–-]\s*\d{4}$/, '–2026'), _live: add };
   });
@@ -6276,6 +6320,147 @@ function getQualifiedTeams() {
   return { firsts, seconds, thirds };
 }
 
+// ── PHASE FINALE FIFA 2026 (16es → finale) ───────────────────────────
+// Bracket + calendrier OFFICIELS. Heures de Paris (CEST). Équipes résolues
+// auto : R32 depuis les classements de groupe ; tours suivants depuis les
+// vainqueurs des matchs précédents. Source = ['f'|'s'|'t', groupe] (1er/2e/3e)
+// ou ['w'|'l', numéroMatch] (vainqueur/perdant). Clé de score = `${round}_${i}`.
+// Attribution des 8 meilleurs 3es selon Annexe C (qualifiés : B,D,E,F,I,J,K,L).
+const KO = [
+  // ── 16es de finale (M73–88) ──
+  { r:'R32', i:0,  n:73, d:'28 Juin',   t:'21:00', v:'SoFi Stadium, LA',               utc:'2026-06-28T19:00Z', A:['s','A'], B:['s','B'] },
+  { r:'R32', i:1,  n:74, d:'29 Juin',   t:'22:30', v:'Gillette Stadium, Boston',       utc:'2026-06-29T20:30Z', A:['f','E'], B:['t','D'] },
+  { r:'R32', i:2,  n:75, d:'30 Juin',   t:'03:00', v:'Estadio BBVA, Monterrey',        utc:'2026-06-30T01:00Z', A:['f','F'], B:['s','C'] },
+  { r:'R32', i:3,  n:76, d:'29 Juin',   t:'19:00', v:'NRG Stadium, Houston',           utc:'2026-06-29T17:00Z', A:['f','C'], B:['s','F'] },
+  { r:'R32', i:4,  n:77, d:'30 Juin',   t:'23:00', v:'MetLife Stadium, NY',            utc:'2026-06-30T21:00Z', A:['f','I'], B:['t','F'] },
+  { r:'R32', i:5,  n:78, d:'30 Juin',   t:'19:00', v:'AT&T Stadium, Dallas',           utc:'2026-06-30T17:00Z', A:['s','E'], B:['s','I'] },
+  { r:'R32', i:6,  n:79, d:'1 Juillet', t:'03:00', v:'Estadio Azteca, Mexico City',    utc:'2026-07-01T01:00Z', A:['f','A'], B:['t','E'] },
+  { r:'R32', i:7,  n:80, d:'1 Juillet', t:'18:00', v:'Mercedes-Benz Stadium, Atlanta', utc:'2026-07-01T16:00Z', A:['f','L'], B:['t','K'] },
+  { r:'R32', i:8,  n:81, d:'2 Juillet', t:'02:00', v:'Levis Stadium, San Jose',        utc:'2026-07-02T00:00Z', A:['f','D'], B:['t','B'] },
+  { r:'R32', i:9,  n:82, d:'1 Juillet', t:'22:00', v:'Lumen Field, Seattle',           utc:'2026-07-01T20:00Z', A:['f','G'], B:['t','I'] },
+  { r:'R32', i:10, n:83, d:'3 Juillet', t:'01:00', v:'BMO Field, Toronto',             utc:'2026-07-02T23:00Z', A:['s','K'], B:['s','L'] },
+  { r:'R32', i:11, n:84, d:'2 Juillet', t:'21:00', v:'SoFi Stadium, LA',               utc:'2026-07-02T19:00Z', A:['f','H'], B:['s','J'] },
+  { r:'R32', i:12, n:85, d:'3 Juillet', t:'05:00', v:'BC Place, Vancouver',            utc:'2026-07-03T03:00Z', A:['f','B'], B:['t','J'] },
+  { r:'R32', i:13, n:86, d:'4 Juillet', t:'00:00', v:'Hard Rock Stadium, Miami',       utc:'2026-07-03T22:00Z', A:['f','J'], B:['s','H'] },
+  { r:'R32', i:14, n:87, d:'4 Juillet', t:'03:30', v:'Arrowhead Stadium, KC',          utc:'2026-07-04T01:30Z', A:['f','K'], B:['t','L'] },
+  { r:'R32', i:15, n:88, d:'3 Juillet', t:'20:00', v:'AT&T Stadium, Dallas',           utc:'2026-07-03T18:00Z', A:['s','D'], B:['s','G'] },
+  // ── 8es de finale (M89–96) ──
+  { r:'R16', i:0, n:89, d:'4 Juillet', t:'23:00', v:'Lincoln Financial, Phila.',       utc:'2026-07-04T21:00Z', A:['w',74], B:['w',77] },
+  { r:'R16', i:1, n:90, d:'4 Juillet', t:'19:00', v:'NRG Stadium, Houston',            utc:'2026-07-04T17:00Z', A:['w',73], B:['w',75] },
+  { r:'R16', i:2, n:91, d:'5 Juillet', t:'22:00', v:'MetLife Stadium, NY',             utc:'2026-07-05T20:00Z', A:['w',76], B:['w',78] },
+  { r:'R16', i:3, n:92, d:'6 Juillet', t:'02:00', v:'Estadio Azteca, Mexico City',     utc:'2026-07-06T00:00Z', A:['w',79], B:['w',80] },
+  { r:'R16', i:4, n:93, d:'6 Juillet', t:'21:00', v:'AT&T Stadium, Dallas',            utc:'2026-07-06T19:00Z', A:['w',83], B:['w',84] },
+  { r:'R16', i:5, n:94, d:'7 Juillet', t:'02:00', v:'Lumen Field, Seattle',            utc:'2026-07-07T00:00Z', A:['w',81], B:['w',82] },
+  { r:'R16', i:6, n:95, d:'7 Juillet', t:'18:00', v:'Mercedes-Benz Stadium, Atlanta',  utc:'2026-07-07T16:00Z', A:['w',86], B:['w',88] },
+  { r:'R16', i:7, n:96, d:'7 Juillet', t:'22:00', v:'BC Place, Vancouver',             utc:'2026-07-07T20:00Z', A:['w',85], B:['w',87] },
+  // ── Quarts de finale (M97–100) ──
+  { r:'QF', i:0, n:97,  d:'9 Juillet',  t:'22:00', v:'Gillette Stadium, Boston',       utc:'2026-07-09T20:00Z', A:['w',89], B:['w',90] },
+  { r:'QF', i:1, n:98,  d:'10 Juillet', t:'21:00', v:'SoFi Stadium, LA',              utc:'2026-07-10T19:00Z', A:['w',93], B:['w',94] },
+  { r:'QF', i:2, n:99,  d:'11 Juillet', t:'23:00', v:'Hard Rock Stadium, Miami',      utc:'2026-07-11T21:00Z', A:['w',91], B:['w',92] },
+  { r:'QF', i:3, n:100, d:'12 Juillet', t:'03:00', v:'Arrowhead Stadium, KC',         utc:'2026-07-12T01:00Z', A:['w',95], B:['w',96] },
+  // ── Demi-finales (M101–102) ──
+  { r:'SF', i:0, n:101, d:'14 Juillet', t:'21:00', v:'AT&T Stadium, Dallas',          utc:'2026-07-14T19:00Z', A:['w',97], B:['w',98] },
+  { r:'SF', i:1, n:102, d:'15 Juillet', t:'21:00', v:'Mercedes-Benz Stadium, Atlanta', utc:'2026-07-15T19:00Z', A:['w',99], B:['w',100] },
+  // ── Match 3e place (M103) ──
+  { r:'3P', i:0, n:103, d:'18 Juillet', t:'23:00', v:'Hard Rock Stadium, Miami',      utc:'2026-07-18T21:00Z', A:['l',101], B:['l',102] },
+  // ── Finale (M104) ──
+  { r:'F',  i:0, n:104, d:'19 Juillet', t:'21:00', v:'MetLife Stadium, NY',           utc:'2026-07-19T19:00Z', A:['w',101], B:['w',102] },
+];
+const _KO_BY_NUM = {}; KO.forEach(m => { _KO_BY_NUM[m.n] = m; });
+const _KO_ROUND_NAME = { R32:'16es de finale', R16:'8es de finale', QF:'Quarts de finale', SF:'Demi-finales', '3P':'Match 3e place', F:'Finale' };
+
+// Classement d'un groupe (null si le groupe n'est pas terminé).
+function _koStandings(L) { return isGroupComplete(L) ? getGroupStandings(L) : null; }
+
+// Cherche l'objet équipe complet (avec code) par nom dans tous les groupes.
+function _koTeamByName(name) {
+  if (!name) return null;
+  return GROUPS.flatMap(g => g.teams).find(t => t.name === name) || null;
+}
+
+// Résout une source ['f'|'s'|'t',G] ou ['w'|'l',num] en objet équipe (ou null).
+function _koResolve(src) {
+  if (!src) return null;
+  const [kind, ref] = src;
+  let teamObj = null;
+  if (kind === 'f' || kind === 's' || kind === 't') {
+    const st = _koStandings(ref);
+    if (st) teamObj = st[kind === 'f' ? 0 : kind === 's' ? 1 : 2] || null;
+  } else if (kind === 'w') {
+    teamObj = _koWinner(ref, false);
+  } else if (kind === 'l') {
+    teamObj = _koWinner(ref, true);
+  }
+  return teamObj ? (_koTeamByName(teamObj.name) || teamObj) : null;
+}
+
+// Libellé d'une source non encore résolue (ex: "1er Gr.A", "Vainqueur M73").
+function _koLabel(src) {
+  if (!src) return '';
+  const [kind, ref] = src;
+  if (kind === 'f') return `1er Gr.${ref}`;
+  if (kind === 's') return `2e Gr.${ref}`;
+  if (kind === 't') return `3e Gr.${ref}`;
+  if (kind === 'w') return `Vainqueur M${ref}`;
+  if (kind === 'l') return `Perdant M${ref}`;
+  return '';
+}
+
+// Vainqueur (ou perdant si loser=true) du match FIFA `num`, ou null si indécis.
+// Nul = indécis (tirs au but non gérés par la saisie de score simple).
+function _koWinner(num, loser) {
+  const m = _KO_BY_NUM[num];
+  if (!m) return null;
+  const a = _koResolve(m.A), b = _koResolve(m.B);
+  if (!a || !b) return null;
+  const sc = (typeof state !== 'undefined' && state.scores) ? state.scores[m.r + '_' + m.i] : null;
+  if (!sc || !sc.includes('-')) return null;
+  const p = sc.split('-'); const hg = parseInt(p[0]), ag = parseInt(p[1]);
+  if (isNaN(hg) || isNaN(ag) || hg === ag) return null;
+  const winA = hg > ag;
+  return loser ? (winA ? b : a) : (winA ? a : b);
+}
+
+// Groupes synthétiques de la phase finale (un par tour) pour calendrier/live/pronos.
+// Les équipes non résolues affichent le libellé (ex: "Vainqueur M73").
+function _koGroups() {
+  return ['R32', 'R16', 'QF', 'SF', '3P', 'F'].map(r => {
+    const ms = KO.filter(x => x.r === r).sort((x, y) => x.i - y.i);
+    const teamSet = new Map();
+    const matches = ms.map(x => {
+      const ta = _koResolve(x.A), tb = _koResolve(x.B);
+      if (ta) teamSet.set(ta.name, ta);
+      if (tb) teamSet.set(tb.name, tb);
+      return {
+        h: ta ? ta.name : _koLabel(x.A),
+        a: tb ? tb.name : _koLabel(x.B),
+        d: x.d, t: x.t, v: x.v, utc: x.utc, s: null, _ko: true,
+        la: _koLabel(x.A), lb: _koLabel(x.B),
+      };
+    });
+    return { id: r, name: _KO_ROUND_NAME[r], teams: [...teamSet.values()], matches };
+  });
+}
+
+// Matchs d'un tour pour l'affichage bracket : [{a,la,b,lb,sch,key}].
+function _koDisplayRound(r) {
+  return KO.filter(x => x.r === r).sort((x, y) => x.i - y.i).map(x => ({
+    a: _koResolve(x.A), la: _koLabel(x.A),
+    b: _koResolve(x.B), lb: _koLabel(x.B),
+    sch: { d: x.d, t: x.t, v: x.v },
+    key: x.r + '_' + x.i,
+  }));
+}
+
+// Nom lisible du tour pour une carte (utilisé hors phase de groupes).
+function _koRoundNameOf(gid) { return _KO_ROUND_NAME[gid] || ''; }
+
+// Liste combinée groupes + phase finale pour le calendrier / live / pronos.
+function _allFixtureGroups() { return GROUPS.concat(_koGroups()); }
+function _findFixtureGroup(gid) {
+  return GROUPS.find(x => x.id === gid) || _koGroups().find(x => x.id === gid) || null;
+}
+
 // ── Club stats per player id ─────────────────────────────────────────
 const PLAYER_CLUB_STATS = {
   'fr24': { // Kylian Mbappé
@@ -6556,25 +6741,11 @@ function renderKnockout() {
   const container = document.getElementById('knockout-bracket');
   if (!container) return;
 
-  const { firsts, seconds, thirds } = getQualifiedTeams();
-  const GR = ['A','B','C','D','E','F','G','H','I','J','K','L'];
-  const f = (i) => firsts[i];
-  const s = (i) => seconds[i];
-  const t = (i) => thirds[i];
-  const fl = (i) => `1er Gr.${GR[i]}`;
-  const sl = (i) => `2e Gr.${GR[i]}`;
-  const tl = () => `Meilleur 3e`;
-
-  const m32 = [
-    { a: f(0), la: fl(0), b: t(0), lb: tl() }, { a: s(1), la: sl(1), b: s(2), lb: sl(2) },
-    { a: f(4), la: fl(4), b: t(1), lb: tl() }, { a: f(5), la: fl(5), b: t(2), lb: tl() },
-    { a: f(2), la: fl(2), b: t(3), lb: tl() }, { a: s(3), la: sl(3), b: s(4), lb: sl(4) },
-    { a: f(7), la: fl(7), b: t(4), lb: tl() }, { a: f(8), la: fl(8), b: t(5), lb: tl() },
-    { a: f(1), la: fl(1), b: t(6), lb: tl() }, { a: s(5), la: sl(5), b: s(6), lb: sl(6) },
-    { a: f(3), la: fl(3), b: t(7), lb: tl() }, { a: s(7), la: sl(7), b: s(8), lb: sl(8) },
-    { a: f(6), la: fl(6), b: s(0), lb: sl(0) }, { a: f(9), la: fl(9), b: s(10), lb: sl(10) },
-    { a: f(10), la: fl(10), b: s(9), lb: sl(9) }, { a: f(11), la: fl(11), b: s(11), lb: sl(11) }
-  ];
+  const m32  = _koDisplayRound('R32');
+  const r16d = _koDisplayRound('R16');
+  const qfd  = _koDisplayRound('QF');
+  const sfd  = _koDisplayRound('SF');
+  const fd   = _koDisplayRound('F');
 
   const renderKOTeam = (team, label, winner = false) => {
     const src = team ? getFlagImg(team.code) : null;
@@ -6589,12 +6760,27 @@ function renderKnockout() {
       </div>`;
   };
 
-  const renderKOMatch = (t1, la, t2, lb, phaseClass = '') => `
-    <div class="ko-match ${phaseClass}">
-      ${renderKOTeam(t1, la)}
-      <div class="ko-vs">VS</div>
-      ${renderKOTeam(t2, lb)}
+  const renderKOMatch = (t1, la, t2, lb, phaseClass = '', sch = null, key = null) => {
+    const score = key ? state.scores[key] : null;
+    let hWin = false, aWin = false;
+    if (score && score.includes('-')) {
+      const [hg, ag] = score.split('-').map(s => parseInt(s));
+      if (!isNaN(hg) && !isNaN(ag) && hg !== ag) { hWin = hg > ag; aWin = ag > hg; }
+    }
+    const clickable = !!(key && t1 && t2);
+    const isAdmin = (localStorage.getItem('wc2026_pseudo') || '') === '_admin_';
+    const [kr, ki] = clickable ? key.split('_') : [];
+    const editBtn = isAdmin && clickable
+      ? `<button class="ko-edit-btn" onclick="event.stopPropagation();promptScore('${kr}',${ki},'${t1.name.replace(/'/g, "\\'")}','${t2.name.replace(/'/g, "\\'")}')">✏️</button>`
+      : '';
+    return `
+    <div class="ko-match ${phaseClass} ${clickable ? 'ko-clickable' : ''}" ${clickable ? `onclick="gpMatchClick('${kr}',${ki})"` : ''}>
+      ${sch && sch.d ? `<div class="ko-match-date">${sch.d} · ${sch.t}<span class="ko-match-venue">${sch.v}</span>${editBtn}</div>` : editBtn}
+      ${renderKOTeam(t1, la, hWin)}
+      <div class="ko-vs ${score ? 'ko-vs-score' : ''}">${score || 'VS'}</div>
+      ${renderKOTeam(t2, lb, aWin)}
     </div>`;
+  };
 
   // Panneau "Groupes" (style FIFA) : mini-classements des 12 groupes
   const groupsPanelHtml = `<div class="ko-grp-grid">${GROUPS.map(g => {
@@ -6616,31 +6802,12 @@ function renderKnockout() {
 
   const phases = [
     { id: 'pg',   label: 'Groupes',      icon: '▤', cls: 'ko-pg',   cols: 0, matches: [] },
-    { id: 'r32a', label: '32èmes (1/2)', icon: '⚡', cls: 'ko-r32',  cols: 4, matches: m32.slice(0, 8) },
-    { id: 'r32b', label: '32èmes (2/2)', icon: '⚡', cls: 'ko-r32b', cols: 4, matches: m32.slice(8) },
-    { id: 'r16',  label: '16èmes',       icon: '🔥', cls: 'ko-r16',  cols: 4, matches: [
-      { a: null, la: 'V. M1',  b: null, lb: 'V. M2'  },
-      { a: null, la: 'V. M3',  b: null, lb: 'V. M4'  },
-      { a: null, la: 'V. M5',  b: null, lb: 'V. M6'  },
-      { a: null, la: 'V. M7',  b: null, lb: 'V. M8'  },
-      { a: null, la: 'V. M9',  b: null, lb: 'V. M10' },
-      { a: null, la: 'V. M11', b: null, lb: 'V. M12' },
-      { a: null, la: 'V. M13', b: null, lb: 'V. M14' },
-      { a: null, la: 'V. M15', b: null, lb: 'V. M16' },
-    ]},
-    { id: 'qf', label: 'Quarts',   icon: '💥', cls: 'ko-qf', cols: 2, matches: [
-      { a: null, la: 'V. R16-1', b: null, lb: 'V. R16-2' },
-      { a: null, la: 'V. R16-3', b: null, lb: 'V. R16-4' },
-      { a: null, la: 'V. R16-5', b: null, lb: 'V. R16-6' },
-      { a: null, la: 'V. R16-7', b: null, lb: 'V. R16-8' },
-    ]},
-    { id: 'sf', label: 'Demis',    icon: '⭐', cls: 'ko-sf', cols: 2, matches: [
-      { a: null, la: 'V. QF1', b: null, lb: 'V. QF2' },
-      { a: null, la: 'V. QF3', b: null, lb: 'V. QF4' },
-    ]},
-    { id: 'final', label: '🏆 Finale', icon: '', cls: 'ko-final', cols: 1, matches: [
-      { a: null, la: 'Finaliste 1', b: null, lb: 'Finaliste 2' },
-    ]},
+    { id: 'r32a', label: '16es (1/2)', icon: '⚡', cls: 'ko-r32',  cols: 4, matches: m32.slice(0, 8) },
+    { id: 'r32b', label: '16es (2/2)', icon: '⚡', cls: 'ko-r32b', cols: 4, matches: m32.slice(8) },
+    { id: 'r16',  label: '8èmes',        icon: '🔥', cls: 'ko-r16',  cols: 4, matches: r16d },
+    { id: 'qf',   label: 'Quarts',       icon: '💥', cls: 'ko-qf',   cols: 2, matches: qfd  },
+    { id: 'sf',   label: 'Demis',        icon: '⭐', cls: 'ko-sf',   cols: 2, matches: sfd  },
+    { id: 'final', label: '🏆 Finale',   icon: '',  cls: 'ko-final', cols: 1, matches: fd   },
   ];
 
   // ── MOBILE : bracket continu style FIFA (colonnes + connecteurs, pan horizontal) ──
@@ -6649,7 +6816,7 @@ function renderKnockout() {
       <div class="bk-team ${t ? '' : 'bk-tbd'}">
         ${t ? `<span class="bk-flag">${t.flag}</span><b>${t.code || t.name}</b>` : `<span class="bk-lbl">${label}</span>`}
       </div>`;
-    const bkMatch = (m) => `<div class="bk-match">${bkTeam(m.a, m.la)}${bkTeam(m.b, m.lb)}</div>`;
+    const bkMatch = (m) => `<div class="bk-match">${m.sch && m.sch.d ? `<div class="bk-match-date">${m.sch.d} · ${m.sch.t}</div>` : ''}${bkTeam(m.a, m.la)}${bkTeam(m.b, m.lb)}</div>`;
     const bkPairs = (ms) => {
       const out = [];
       for (let j = 0; j < ms.length; j += 2) {
@@ -6679,7 +6846,7 @@ function renderKnockout() {
       </div>`;
     }).join('')}</div>`;
 
-    const stages = [['pg','PG'], ['r32','32es'], ['r16','16es'], ['qf','QF'], ['sf','DF'], ['f','F']];
+    const stages = [['pg','PG'], ['r32','16es'], ['r16','8es'], ['qf','QF'], ['sf','DF'], ['f','F']];
     const bkTabs = `<div class="ko-tabs bk-tabs">${stages.map(([id, l], i) =>
       `<button class="ko-tab ${i === 0 ? 'active' : ''}" data-bk-tab="${id}" onclick="bkGoto('${id}')">${l}</button>`).join('')}</div>`;
 
@@ -6724,7 +6891,7 @@ function renderKnockout() {
     <div class="ko-panel ${i === 0 ? 'active' : ''}" data-phase="${ph.id}">
       ${ph.id === 'pg' ? groupsPanelHtml : `
       <div class="ko-phase-grid ko-cols-${ph.cols}">
-        ${ph.matches.map(m => renderKOMatch(m.a, m.la, m.b, m.lb, ph.cls)).join('')}
+        ${ph.matches.map(m => renderKOMatch(m.a, m.la, m.b, m.lb, ph.cls, m.sch, m.key)).join('')}
       </div>`}
     </div>`).join('');
 
